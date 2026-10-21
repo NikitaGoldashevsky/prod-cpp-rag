@@ -185,6 +185,7 @@ INDEX_HTML = r"""<!doctype html>
           --fg:#e6edf3; --dim:#8b949e; --acc:#4c9aff; --ok:#3fb950;
           --warn:#d29922; --bad:#f85149; --mono:ui-monospace,SFMono-Regular,Menlo,monospace; }
   * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
   body { margin:0; background:var(--bg); color:var(--fg);
          font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
   header { display:flex; gap:16px; align-items:center; padding:12px 22px;
@@ -306,7 +307,7 @@ INDEX_HTML = r"""<!doctype html>
   </section>
 
   <!-- INDEXES -->
-  <section class="view" id="v-idx">
+  <section class="view" id="v-indexes">
     <div class="card">
       <h2>Indexes</h2>
       <div id="idxBody" class="hint">loading…</div>
@@ -514,7 +515,22 @@ async function openEntity(name) {
   } catch (e) { alert(e.message); }
 }
 
-refresh();
+/* deep links: ?q=... asks on load, ?view=indexes|browse opens a tab */
+function applyUrl() {
+  const p = new URLSearchParams(location.search);
+  const v = p.get('view');
+  if (v) {
+    const b = document.querySelector(`nav button[data-v="${v}"]`);
+    if (b) b.click();
+  }
+  const q = p.get('q');
+  if (q) {
+    $('q').value = q;
+    $('askBtn').click();
+  }
+}
+
+refresh().then(applyUrl);
 </script>
 </body>
 </html>

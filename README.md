@@ -317,8 +317,15 @@ you change it, change it there too and re-run the parity check.
 - **Freshness is reported, not enforced.** A stale index still answers; call
   `index_status` or `reindex`.
 - **Indexes are whole-subtree.** There is no incremental per-file update yet;
-  a rebuild re-parses the subtree (fast: ~100 ms for 32 files, ~1 s for a few
-  hundred).
+  a rebuild re-parses the whole indexed subtree. Measured on this machine:
+
+  | files | entities | chunks | build | rescan | index.json | load+BM25 | search |
+  |-------|----------|--------|-------|--------|-----------|-----------|--------|
+  | 32    | 420      | 235    | 0.13s | ~40ms  | 0.4 MB    | ~60ms     | 11ms   |
+  | 600   | 3302     | 2100   | 1.5s  | 78ms   | 2.6 MB    | 630ms     | 45ms   |
+
+  Past a few thousand files, start with a submodule and grow. The JSON snapshot
+  is what makes indexes easy to copy between machines.
 - **Verification is same-model.** The Q&A verifier judges its own generator's
   draft. Useful, not independent.
 

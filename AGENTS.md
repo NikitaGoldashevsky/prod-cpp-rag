@@ -198,7 +198,7 @@ reindex("<name>")           -> rebuild (touches only the index, never the source
 ```
 
 `reindex` re-parses the whole indexed subtree. It is fast (fractions of a second
-for a small submodule) but not incremental.
+for a small submodule, ~1.5 s for 600 files) but not incremental.
 
 ---
 
