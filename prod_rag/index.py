@@ -405,6 +405,9 @@ class LoadedIndex:
                  "line_end": onto.entities[eid].line_end}
                 for eid in res["linked"] if eid in onto.entities],
             "facts": facts,
+            "hint": (None if res["chunks"] else
+                     "no chunk matched this wording — try a symbol name from the "
+                     "codebase, or use find_symbol/glob (e.g. 'Tcp*')"),
             "chunks": [
                 {"id": ch["id"], "kind": ch.get("kind"), "qname": ch.get("qname"),
                  "file": ch.get("file"), "line_start": ch.get("line_start"),

@@ -97,7 +97,8 @@ class Service:
             results.append(r)
         if len(results) == 1:
             return results[0]
-        return {"query": query, "indexes": results}
+        return {"query": query, "indexes": results,
+                "hint": next((r["hint"] for r in results if r.get("hint")), None)}
 
     def entity(self, name: str, index: str | None = None) -> dict:
         found = []
