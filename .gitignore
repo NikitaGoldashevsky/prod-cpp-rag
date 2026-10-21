@@ -5,3 +5,6 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+
+# local scratch
+prod-cpp-rag/

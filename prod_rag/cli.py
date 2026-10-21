@@ -9,6 +9,7 @@ import os
 import sys
 
 from . import index as idx_mod
+from . import store as store_mod
 
 
 def _print_table(rows, headers):
@@ -32,9 +33,20 @@ def _print_table(rows, headers):
 def cmd_index_add(args) -> int:
     exts = tuple(args.ext) if args.ext else idx_mod.CPP_EXTS
     exclude = tuple(args.exclude) if args.exclude else idx_mod.DEFAULT_EXCLUDE
+    target = (args.store or store_mod.store_kind()).lower()
     meta = idx_mod.build(args.name, args.path, exts=exts, exclude=exclude,
-                         label=args.label)
+                         label=args.label, with_retriever=(target != "neo4j"))
     print(f"stored at {idx_mod.index_dir(args.name)}/index.json")
+
+    if target == "neo4j":
+        payload = idx_mod.load(args.name).payload
+        st = store_mod.Neo4jStore()
+        try:
+            stats = st.load_index(payload, clear=not args.keep)
+            print(f"pushed to Neo4j: {stats['entities']} entities, "
+                  f"{stats['relations']} relations, {stats['chunks']} chunks")
+        finally:
+            st.close()
     return 0
 
 
@@ -85,6 +97,34 @@ def cmd_index_status(args) -> int:
     return rc
 
 
+def cmd_neo4j_status(args) -> int:
+    from . import store as store_mod
+    try:
+        st = store_mod.Neo4jStore()
+    except Exception as e:
+        print(f"Neo4j not reachable: {e}", file=sys.stderr)
+        return 1
+    try:
+        st.ensure_schema()
+        print(f"uri     {st.uri}")
+        print("counts  " + json.dumps(st.stats()))
+    finally:
+        st.close()
+    return 0
+
+
+def cmd_neo4j_push(args) -> int:
+    from . import store as store_mod
+    payload = idx_mod.load(args.name).payload
+    st = store_mod.Neo4jStore()
+    try:
+        stats = st.load_index(payload, clear=not args.keep)
+        print("pushed: " + json.dumps(stats))
+    finally:
+        st.close()
+    return 0
+
+
 def cmd_index_remove(args) -> int:
     if idx_mod.remove(args.name):
         print(f"removed index {args.name!r}")
@@ -99,7 +139,8 @@ def cmd_index_remove(args) -> int:
 
 def _service(args):
     from .service import Service
-    return Service(getattr(args, "index", None))
+    return Service(getattr(args, "index", None),
+                   store_kind=getattr(args, "store", None))
 
 
 def cmd_search(args) -> int:
@@ -142,6 +183,16 @@ def cmd_doctor(args) -> int:
         print(f"  mcp         {getattr(mcp, '__version__', 'installed')}")
     except Exception:
         print("  mcp         not installed (MCP server disabled; pip install 'mcp>=1.2')")
+    kind = store_mod.store_kind()
+    print(f"  store       {kind}")
+    if kind == "neo4j":
+        try:
+            neo = store_mod.Neo4jStore()
+            print(f"    neo4j     {neo.uri} {json.dumps(neo.stats())}")
+            neo.close()
+        except Exception as e:
+            ok = False
+            print(f"    neo4j     UNREACHABLE: {e}")
     metas = idx_mod.list_indexes()
     print(f"  data dir    {idx_mod.data_dir()}")
     print(f"  indexes     {len(metas)}")
@@ -177,6 +228,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="file extension to include (repeatable; default: C/C++)")
     a.add_argument("--exclude", action="append",
                    help="directory name to skip (repeatable)")
+    a.add_argument("--store", choices=("memory", "neo4j"),
+                   help="also push this index into a backend (default: $PROD_RAG_STORE)")
+    a.add_argument("--keep", action="store_true",
+                   help="with --store neo4j: keep existing graph contents")
     a.set_defaults(func=cmd_index_add)
 
     l = isub.add_parser("list", help="list indexes")
@@ -197,12 +252,26 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("query")
     se.add_argument("--index", action="append")
     se.add_argument("--top-k", type=int, default=6)
+    se.add_argument("--store", choices=("memory", "neo4j"),
+                    default=os.environ.get("PROD_RAG_STORE"))
     se.set_defaults(func=cmd_search)
 
     en = sub.add_parser("entity", help="look up one entity")
     en.add_argument("name")
     en.add_argument("--index", action="append")
+    en.add_argument("--store", choices=("memory", "neo4j"),
+                    default=os.environ.get("PROD_RAG_STORE"))
     en.set_defaults(func=cmd_entity)
+
+    # neo4j
+    nj = sub.add_parser("neo4j", help="manage the Neo4j backend")
+    jsub = nj.add_subparsers(dest="jsub", required=True)
+    js = jsub.add_parser("status", help="connection + graph counts")
+    js.set_defaults(func=cmd_neo4j_status)
+    jp = jsub.add_parser("push", help="push an existing index into Neo4j")
+    jp.add_argument("name")
+    jp.add_argument("--keep", action="store_true", help="do not wipe existing data")
+    jp.set_defaults(func=cmd_neo4j_push)
 
     # doctor
     d = sub.add_parser("doctor", help="check the installation")
@@ -217,6 +286,8 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--llm-model", default=os.environ.get("PROD_RAG_LLM_MODEL"))
     w.add_argument("--llm-api-key", default=os.environ.get("PROD_RAG_LLM_API_KEY"))
     w.add_argument("--token", default=os.environ.get("PROD_RAG_TOKEN"))
+    w.add_argument("--store", choices=("memory", "neo4j"),
+                   default=os.environ.get("PROD_RAG_STORE"))
     w.add_argument("--top-k", type=int, default=5)
     w.add_argument("--max-chars", type=int, default=6000)
     w.set_defaults(func=_cmd_serve)
@@ -230,6 +301,8 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--llm-base-url", default=os.environ.get("PROD_RAG_LLM_BASE_URL"))
     m.add_argument("--llm-model", default=os.environ.get("PROD_RAG_LLM_MODEL"))
     m.add_argument("--llm-api-key", default=os.environ.get("PROD_RAG_LLM_API_KEY"))
+    m.add_argument("--store", choices=("memory", "neo4j"),
+                   default=os.environ.get("PROD_RAG_STORE"))
     m.set_defaults(func=_cmd_mcp)
     return ap
 
@@ -243,7 +316,8 @@ def _cmd_serve(args) -> int:
     for flag, value in (("--llm-base-url", args.llm_base_url),
                         ("--llm-model", args.llm_model),
                         ("--llm-api-key", args.llm_api_key),
-                        ("--token", args.token)):
+                        ("--token", args.token),
+                        ("--store", args.store)):
         if value:
             argv += [flag, value]
     return web.main(argv)
@@ -256,7 +330,8 @@ def _cmd_mcp(args) -> int:
         argv += ["--index", name]
     for flag, value in (("--llm-base-url", args.llm_base_url),
                         ("--llm-model", args.llm_model),
-                        ("--llm-api-key", args.llm_api_key)):
+                        ("--llm-api-key", args.llm_api_key),
+                        ("--store", args.store)):
         if value:
             argv += [flag, value]
     return mcp_server.main(argv)

@@ -188,6 +188,9 @@ def main(argv=None) -> int:
                     help="enable answer_question() with an OpenAI-compatible endpoint")
     ap.add_argument("--llm-model", default=os.environ.get("PROD_RAG_LLM_MODEL"))
     ap.add_argument("--llm-api-key", default=os.environ.get("PROD_RAG_LLM_API_KEY"))
+    ap.add_argument("--store", choices=("memory", "neo4j"),
+                    default=os.environ.get("PROD_RAG_STORE"),
+                    help="graph backend (default $PROD_RAG_STORE or memory)")
     ap.add_argument("--list-indexes", action="store_true",
                     help="print known indexes and exit (for install scripts)")
     args = ap.parse_args(argv)
@@ -199,7 +202,7 @@ def main(argv=None) -> int:
                   f"{s.get('entities', '?')} entities\t{m.get('updated_at', '')}")
         return 0
 
-    service = Service(args.index)
+    service = Service(args.index, store_kind=args.store)
     if not service.names():
         print("warning: no indexes built yet — the tools will report none.\n"
               "         build one with: prod-rag index add <name> <path>",

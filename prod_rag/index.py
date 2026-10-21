@@ -58,7 +58,9 @@ DEFAULT_EXCLUDE = (
 def data_dir() -> str:
     base = os.environ.get("PROD_RAG_DATA") or os.environ.get("XDG_DATA_HOME") \
         or os.path.expanduser("~/.local/share")
-    path = os.path.join(base, "prod-rag")
+    # PROD_RAG_DATA may point either at the base or at the prod-rag dir itself
+    path = base if os.path.basename(base.rstrip("/")) == "prod-rag" \
+        else os.path.join(base, "prod-rag")
     os.makedirs(os.path.join(path, "indexes"), exist_ok=True)
     return path
 
@@ -171,7 +173,8 @@ def _subtree_files(files: dict, rel_dir: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def build(name: str, root: str, exts=CPP_EXTS, exclude=DEFAULT_EXCLUDE,
-          label: str | None = None, verbose: bool = True) -> dict:
+          label: str | None = None, verbose: bool = True,
+          with_retriever: bool = True) -> dict:
     """Parse `root` and write the index under `name`."""
     if not valid_name(name):
         raise ValueError(f"invalid index name {name!r} (letters, digits, - _ . only)")
@@ -186,9 +189,15 @@ def build(name: str, root: str, exts=CPP_EXTS, exclude=DEFAULT_EXCLUDE,
             f"no C/C++ files under {root} "
             f"(extensions {', '.join(exts)}; exclusions {', '.join(exclude)})")
 
-    onto = oc.build_from_dir(root) if len(files) > 1 else \
-        oc.build_from_file(os.path.join(root, next(iter(files))))
-    onto.build_retriever()
+    if len(files) > 1:
+        onto = oc.build_from_dir(root, with_retriever=with_retriever)
+    else:
+        onto = oc.build_from_file(os.path.join(root, next(iter(files))))
+        if not with_retriever:
+            onto._bm25 = None
+    if with_retriever:
+        onto.build_retriever()      # BM25 over every chunk; skipped for Neo4j,
+                                    # where Lucene does the lexical work
     build_ms = int((time.time() - t0) * 1000)
 
     payload = {
@@ -211,7 +220,8 @@ def build(name: str, root: str, exts=CPP_EXTS, exclude=DEFAULT_EXCLUDE,
             "chunks": len(onto.chunks),
             "kinds": dict(Counter(e.kind for e in onto.entities.values())),
         },
-        "entities": [dataclasses.asdict(e) for e in onto.entities.values()],
+        "entities": [{**dataclasses.asdict(e), "fact_card": onto._card(e)}
+                     for e in onto.entities.values()],
         "relations": [dataclasses.asdict(r) for r in onto.relations],
         "chunks": onto.chunks,
     }
@@ -281,8 +291,9 @@ def exists(name: str) -> bool:
 class LoadedIndex:
     """One index, opened: ontology in memory, BM25 built, freshness known."""
 
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, store: "object | None" = None):
         self.payload = payload
+        self._store = store          # GraphStore; defaults to MemoryStore
         self.name = payload["name"]
         self.label = payload.get("label") or self.name
         self.root = payload["root"]
@@ -298,11 +309,15 @@ class LoadedIndex:
     def onto(self) -> oc.CppOntology:
         if self._onto is None:
             onto = oc.CppOntology(self.label)
-            onto.entities = {e["id"]: oc.Entity(**e) for e in self.payload["entities"]}
+            fields = {f for f in oc.Entity.__dataclass_fields__}
+            onto.entities = {
+                e["id"]: oc.Entity(**{k: v for k, v in e.items() if k in fields})
+                for e in self.payload["entities"]}
             onto.relations = [oc.Relation(**r) for r in self.payload["relations"]]
             onto.chunks = self.payload["chunks"]
             onto.files = sorted({e.file for e in onto.entities.values() if e.file})
-            onto.build_retriever()
+            if self._store is None or getattr(self._store, "name", "") != "neo4j":
+                onto.build_retriever()
             self._onto = onto
         return self._onto
 
@@ -376,160 +391,35 @@ class LoadedIndex:
         self._fresh = result
         return result
 
+    # ---- storage backend --------------------------------------------------
+    @property
+    def store(self):
+        """The graph backend answering this index (memory by default)."""
+        if self._store is None:
+            from .store import MemoryStore
+            self._store = MemoryStore(self.onto)
+        return self._store
+
     # ---- retrieval --------------------------------------------------------
     def search(self, query: str, top_k: int = 8, hops: int = 1) -> dict:
-        onto = self.onto
-        res = onto.retrieve(query, top_k=top_k, hops=hops)
-        facts = res["facts"]
-        if not facts:
-            # A question that names no entity ("where are exceptions thrown
-            # unguarded?") links nothing, but the chunks it still finds carry
-            # fact cards. Return those rather than no ontology evidence at all.
-            cards, seen = [], set()
-            for ch, _ in res["chunks"][:3]:
-                eid = ch["id"]
-                if eid in onto.entities and eid not in seen:
-                    seen.add(eid)
-                    cards.append(onto._card(onto.entities[eid]))
-            facts = "\n\n".join(cards)
-        return {
-            "index": self.name,
-            "query": query,
-            "linked": [
-                {"id": eid,
-                 "name": onto.entities[eid].name,
-                 "qname": onto.entities[eid].qname or onto.entities[eid].name,
-                 "kind": onto.entities[eid].kind,
-                 "file": onto.entities[eid].file,
-                 "line_start": onto.entities[eid].line_start,
-                 "line_end": onto.entities[eid].line_end}
-                for eid in res["linked"] if eid in onto.entities],
-            "facts": facts,
-            "hint": (None if res["chunks"] else
-                     "no chunk matched this wording — try a symbol name from the "
-                     "codebase, or use find_symbol/glob (e.g. 'Tcp*')"),
-            "chunks": [
-                {"id": ch["id"], "kind": ch.get("kind"), "qname": ch.get("qname"),
-                 "file": ch.get("file"), "line_start": ch.get("line_start"),
-                 "line_end": ch.get("line_end"), "text": ch.get("text", "")}
-                for ch, _ in res["chunks"]],
-        }
+        return self.store.search(query, top_k=top_k, hops=hops)
 
     def entity(self, name: str) -> dict | None:
-        onto = self.onto
-        eid = self._resolve(name)
-        if eid is None:
-            return None
-        return self._entity_payload(eid)
+        return self.store.entity(name)
 
     def _resolve(self, name: str) -> str | None:
-        onto = self.onto
-        if name in onto.entities:
-            return name
-        low = name.lower()
-        exact = [eid for eid, e in onto.entities.items()
-                 if (e.qname or "").lower() == low or e.name.lower() == low]
-        if exact:
-            # prefer a definition over a declaration
-            exact.sort(key=lambda eid: (not onto.entities[eid].is_definition,
-                                        onto.entities[eid].kind in ("Parameter", "File")))
-            return exact[0]
-        sub = [eid for eid, e in onto.entities.items()
-               if low in (e.qname or e.name).lower()]
-        if sub:
-            sub.sort(key=lambda eid: len(onto.entities[eid].qname or onto.entities[eid].name))
-            return sub[0]
-        return None
-
-    def _entity_payload(self, eid: str) -> dict:
-        onto = self.onto
-        e = onto.entities[eid]
-        calls = [onto.entities[r.o].qname if r.o in onto.entities else r.o
-                 for r in onto.relations if r.s == eid and r.p == "calls"]
-        refs = [onto.entities[r.o].qname if r.o in onto.entities else r.o
-                for r in onto.relations if r.s == eid and r.p == "references"]
-        uses = [r.o for r in onto.relations if r.s == eid and r.p == "callsExternal"]
-        inits = [onto.entities[r.o].qname if r.o in onto.entities else r.o
-                 for r in onto.relations if r.s == eid and r.p == "initializes"]
-        inherited = [r.o for r in onto.relations if r.s == eid and r.p == "inheritsFrom"]
-        inherited_by = [r.s for r in onto.relations
-                        if r.o == eid and r.p == "inheritsFrom"]
-        callers = [onto.entities[r.s].qname if r.s in onto.entities else r.s
-                   for r in onto.relations if r.o == eid and r.p == "calls"]
-        members = [onto.entities[r.o].qname if r.o in onto.entities else r.o
-                   for r in onto.relations
-                   if r.s == eid and r.p in ("hasMethod", "hasConstructor", "hasField")]
-        chunk = next((c for c in onto.chunks if c["id"] == eid), None)
-        return {
-            "index": self.name,
-            "id": eid,
-            "kind": e.kind,
-            "name": e.name,
-            "qname": e.qname or e.name,
-            "file": e.file,
-            "line_start": e.line_start,
-            "line_end": e.line_end,
-            "is_definition": e.is_definition,
-            "return_type": e.return_type,
-            "type_ref": e.type_ref,
-            "params": e.params,
-            "modifiers": [k for k, v in
-                          (("const", e.is_const), ("static", e.is_static),
-                           ("virtual", e.is_virtual), ("noexcept", e.is_noexcept)) if v],
-            "has_try_catch": e.has_try_catch,
-            "throw_sites": e.throw_sites,
-            "calls": sorted(set(calls)),
-            "callers": sorted(set(callers)),
-            "references": sorted(set(refs)),
-            "uses": sorted(set(uses)),
-            "initializes": inits,
-            "inherits": inherited,
-            "inherited_by": inherited_by,
-            "members": sorted(set(members)),
-            "fact_card": onto._card(e),
-            "code": chunk["text"] if chunk else e.code,
-        }
+        """Resolve a name to an entity id (used by read_chunk fallbacks)."""
+        hit = self.store.entity(name)
+        return hit["id"] if hit else None
 
     def neighbours(self, name: str, hops: int = 1) -> dict:
-        onto = self.onto
-        eid = self._resolve(name)
-        if eid is None:
-            return {"index": self.name, "found": False, "name": name}
-        ids = onto.neighbour_ids([eid], hops=max(1, min(hops, 3)))
-        return {
-            "index": self.name, "found": True, "root": eid,
-            "entities": [{"id": i, "kind": onto.entities[i].kind,
-                          "qname": onto.entities[i].qname or onto.entities[i].name,
-                          "file": onto.entities[i].file}
-                         for i in ids if i in onto.entities],
-            "facts": onto.fact_cards(ids),
-        }
+        return self.store.neighbours(name, hops=hops)
 
     def find(self, pattern: str, limit: int = 50) -> list[dict]:
-        """Glob-ish or substring search over entity names/qnames."""
-        import fnmatch
-        onto = self.onto
-        pat = pattern.lower()
-        globbed = any(ch in pattern for ch in "*?[]")
-        hits = []
-        for eid, e in onto.entities.items():
-            target = (e.qname or e.name).lower()
-            ok = fnmatch.fnmatch(target, pat) or fnmatch.fnmatch(e.name.lower(), pat) \
-                if globbed else pat in target
-            if ok and e.kind not in ("Parameter", "File", "GlobalBlock", "Header"):
-                hits.append({"id": eid, "kind": e.kind,
-                             "qname": e.qname or e.name,
-                             "file": e.file, "line_start": e.line_start,
-                             "is_definition": e.is_definition})
-        hits.sort(key=lambda h: (len(h["qname"]), h["qname"]))
-        return hits[:limit]
+        return self.store.find(pattern, limit=limit)
 
     def chunk(self, chunk_id: str) -> dict | None:
-        onto = self.onto
-        c = next((c for c in onto.chunks if c["id"] == chunk_id), None)
-        if c is None:
-            return None
-        return {"index": self.name, **c}
+        return self.store.chunk(chunk_id)
 
     def answer(self, question: str, chat, top_k: int = 5, max_chars: int = 6000) -> dict:
         """Full path: retrieve -> generate -> verify -> (correct). Needs a model."""
@@ -542,12 +432,12 @@ class LoadedIndex:
 # loading
 # ---------------------------------------------------------------------------
 
-def load(name: str) -> LoadedIndex:
+def load(name: str, store=None) -> LoadedIndex:
     path = os.path.join(index_dir(name), "index.json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"no index named {name!r} (see `prod-rag index list`)")
     with open(path, encoding="utf-8") as f:
-        return LoadedIndex(json.load(f))
+        return LoadedIndex(json.load(f), store=store)
 
 
 def load_all(names: list[str] | None = None) -> dict[str, LoadedIndex]:

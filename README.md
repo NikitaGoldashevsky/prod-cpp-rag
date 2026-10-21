@@ -3,8 +3,8 @@
 Codebase knowledge for agents and people.
 
 PROD_RAG parses C/C++ with tree-sitter, builds an **ontology** (classes, methods,
-fields, calls, inheritance, exception sites) plus source **chunks**, and serves
-that knowledge two ways:
+fields, calls, inheritance, exception sites) plus source **chunks**, stores it in
+**Neo4j**, and serves that knowledge two ways:
 
 - **MCP server** — so an existing agent (Codewhale, Claude, Cursor, anything that
   speaks MCP) can ask what is *actually* in the codebase instead of guessing.
@@ -34,6 +34,47 @@ The web UI's Q&A box is the exception: it runs the full
 person wants one grounded paragraph rather than a browsing session.
 
 ---
+
+## Storage: Neo4j
+
+The graph lives in a local **Neo4j Community** instance. Ingestion, entity
+lookup, neighbourhood expansion and lexical search are all Cypher — the Python
+side parses source and renders fact cards, never scans the graph.
+
+Why this is the default: on a 500-file / 185k-line tree the ontology is ~40k
+entities and ~204k relations. Scoring every entity in Python took 416–848 ms per
+query; Neo4j answers the same queries in **19–169 ms**. A memory backend still
+exists (`--store memory`) for tests and machines without a database, and
+`tests/test_store_parity.py` proves the two agree on content.
+
+### Installing Neo4j (no root, no Docker)
+
+`./neo4j_setup.sh` in the diploma repo does this; the steps are:
+
+```bash
+# one-shot: pull the official image layers over HTTPS, verify digests,
+# unpack under ~/.local/opt/neo4j (ships its own JDK — no Java install)
+./neo4j_setup.sh
+~/.local/bin/neo4j-local console        # or: start / stop / status
+```
+
+Credentials land in `~/.local/opt/neo4j/credentials.env` (mode 600). PROD_RAG
+reads `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD`, falling back to that file.
+
+If you already run Neo4j (including Neo4j Desktop or Aura), just export:
+
+```bash
+export NEO4J_URI=neo4j://127.0.0.1:7687
+export NEO4J_USER=neo4j
+export NEO4J_PASSWORD=...
+```
+
+**Sizing:** the image rootfs is ~1.2 GB on disk (367 MB of layers). Heap is set
+to 1 GB and pagecache to 512 MB in the shipped config; a 500-file index fits
+comfortably. Verify with `prod-rag neo4j status`.
+
+The Neo4j Browser at `http://127.0.0.1:7474` is useful for the thesis: run
+`MATCH p=(a:Entity)-[:CALLS*1..3]->(b) RETURN p LIMIT 50` and show the graph.
 
 ## Install
 
@@ -74,9 +115,21 @@ An **index** is a named snapshot of one directory subtree. You do not index the
 whole monorepo — you index the submodule you are working in.
 
 ```bash
-prod-rag index add core     ~/work/super/submodules/core
-prod-rag index add network  ~/work/super/submodules/network
+prod-rag index add core     ~/work/super/submodules/core --store neo4j
+prod-rag index add network  ~/work/super/submodules/network --store neo4j
 prod-rag index list
+```
+
+`--store neo4j` pushes the parsed graph into Neo4j as part of the build (and
+skips the Python BM25 index, since Lucene does that work). Without the flag the
+target comes from `PROD_RAG_STORE` (default `memory`).
+
+To push an index you already built:
+
+```bash
+prod-rag neo4j push core          # wipes the graph first
+prod-rag neo4j push core --keep   # merge into what is there
+prod-rag neo4j status
 ```
 
 Starting small is the point: build one submodule, use it, then add more.
@@ -249,11 +302,16 @@ prod-rag index add <name> <path>    build an index
 prod-rag index list                 names, roots, sizes, build times
 prod-rag index status [name]        folder hashes (+ --no-rescan for speed)
 prod-rag index remove <name>        forget an index
+prod-rag neo4j status               connection + graph counts
+prod-rag neo4j push <name>          push an existing index into Neo4j
 prod-rag search "who calls X"       facts + chunks in the terminal
 prod-rag entity TcpClient::connect  full JSON for one entity
-prod-rag serve                      web UI
-prod-rag mcp                        MCP server
+prod-rag serve --store neo4j        web UI
+prod-rag mcp --store neo4j          MCP server
 ```
+
+Select the backend with `--store` or `PROD_RAG_STORE=neo4j`. The MCP server and
+the web UI accept the same flag, so one index serves both.
 
 ---
 
@@ -265,14 +323,36 @@ C/C++ files
    ▼
 entities + relations ── chunker ──► chunks (method / class / field, with file:line)
    │                                  │
-   │ fact cards (exact [FACT] lines)  │ BM25 over chunk text + fact card
+   │ fact cards (exact [FACT] lines)  │
    ▼                                  ▼
-query ──► entity linking ──► 1-hop neighbourhood ──► fact cards + ranked chunks
+        ┌─────────────────  Neo4j  ─────────────────┐
+        │ (:Entity)-[:CALLS|HAS_METHOD|THROWS ...]  │
+        │ (:Chunk)-[:DESCRIBES]->(:Entity)          │
+        │ full-text: entity_text, chunk_text        │
+        └───────────────┬───────────────────────────┘
+                        │ Cypher
+        query ──► full-text match ──► 1-hop expansion ──► fact cards + chunks
                                                         │
                                     ┌───────────────────┴──────────────────┐
                                     ▼                                      ▼
                             MCP tools (evidence)                  Q&A (model + verifier)
 ```
+
+Graph shape:
+
+- `(:Entity {id, kind, name, qname, file, line_start, line_end, fact_card, ...})`
+  plus a kind label (`:Class`, `:Method`, `:Field`, …). `id` is a unique property.
+- `(:Chunk {id, text, ...})-[:DESCRIBES]->(:Entity)`.
+- Predicates are relationship types: `CALLS`, `HAS_METHOD`, `HAS_FIELD`,
+  `INITIALIZES`, `INCLUDES`, `DECLARES`, `REFERENCES`, `HAS_PARAMETER`.
+- Literal objects become stub nodes: `CALLS_EXTERNAL → (:ExternalSymbol)`,
+  `INHERITS_FROM → (:ExternalBase)`, `THROWS {guarded, line} → (:ThrowType)`, so
+  "which calls propagate exceptions unhandled?" is a Cypher predicate.
+- Multiplicity is preserved: an edge carries `ords`, the list of source
+  positions that produced it, so `std::to_string` called three times stays three
+  facts.
+- Two full-text indexes (`entity_text`, `chunk_text`) do the lexical retrieval
+  that BM25 did in the memory backend.
 
 Entities: `File, Header, Class, Struct, Method, Function, Constructor,
 Destructor, Field, Parameter, TypeAlias, GlobalBlock`.
@@ -317,15 +397,20 @@ you change it, change it there too and re-run the parity check.
 - **Freshness is reported, not enforced.** A stale index still answers; call
   `index_status` or `reindex`.
 - **Indexes are whole-subtree.** There is no incremental per-file update yet;
-  a rebuild re-parses the whole indexed subtree. Measured on this machine:
+  a rebuild re-parses and re-pushes the whole indexed subtree.
+- **The Neo4j graph holds one dataset at a time.** `neo4j push` wipes the graph
+  unless `--keep`. Multi-index search is a memory-backend feature.
+- **Parsing, not querying, is the cost at scale.** 500 files / 185k lines →
+  31 s to parse and push 40k entities; queries then run in 19–169 ms.
 
-  | files | entities | chunks | build | rescan | index.json | load+BM25 | search |
-  |-------|----------|--------|-------|--------|-----------|-----------|--------|
-  | 32    | 420      | 235    | 0.13s | ~40ms  | 0.4 MB    | ~60ms     | 11ms   |
-  | 600   | 3302     | 2100   | 1.5s  | 78ms   | 2.6 MB    | 630ms     | 45ms   |
+  Measured (this machine):
 
-  Past a few thousand files, start with a submodule and grow. The JSON snapshot
-  is what makes indexes easy to copy between machines.
+  | files | lines | entities | build+push | rescan | search (mem) | search (Neo4j) |
+  |-------|-------|----------|-----------|--------|--------------|----------------|
+  | 32    | 3k    | 420      | 0.3 s     | 40 ms  | 11 ms        | 15 ms          |
+  | 500   | 185k  | 40,005   | 31 s      | 13 ms  | 416–848 ms   | 19–169 ms      |
+
+  Start with one submodule; grow as needed.
 - **Verification is same-model.** The Q&A verifier judges its own generator's
   draft. Useful, not independent.
 

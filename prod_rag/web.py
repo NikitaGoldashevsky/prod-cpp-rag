@@ -552,13 +552,16 @@ def main(argv=None) -> int:
                     help="OpenAI-compatible endpoint for the Q&A box")
     ap.add_argument("--llm-model", default=os.environ.get("PROD_RAG_LLM_MODEL"))
     ap.add_argument("--llm-api-key", default=os.environ.get("PROD_RAG_LLM_API_KEY"))
+    ap.add_argument("--store", choices=("memory", "neo4j"),
+                    default=os.environ.get("PROD_RAG_STORE"),
+                    help="graph backend (default $PROD_RAG_STORE or memory)")
     ap.add_argument("--token", default=os.environ.get("PROD_RAG_TOKEN"),
                     help="shared secret required by the API (recommended with --host 0.0.0.0)")
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--max-chars", type=int, default=6000)
     args = ap.parse_args(argv)
 
-    service = Service(args.index)
+    service = Service(args.index, store_kind=args.store)
     chat = llm_mod.client_from_env(args.llm_base_url, args.llm_model, args.llm_api_key)
     if chat is not None:
         chat.resolve_model()
@@ -566,6 +569,7 @@ def main(argv=None) -> int:
     app = WebApp(service, chat, default_index=(args.index[0] if args.index else None),
                  top_k=args.top_k, max_chars=args.max_chars, token=args.token)
 
+    print(f"store:   {service.kind}")
     print(f"indexes: {', '.join(service.names()) or '(none)'}")
     print(f"model:   {chat.base_url if chat else 'not configured (Q&A disabled)'}")
     if args.host in ("0.0.0.0", "::") and not args.token:

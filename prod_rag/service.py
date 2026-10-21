@@ -11,23 +11,38 @@ import threading
 import time
 
 from . import index as idx_mod
+from . import store as store_mod
 
 
 class Service:
     """Loaded indexes + the operations both front ends offer."""
 
-    def __init__(self, names: list[str] | None = None, auto_load_all: bool = True):
+    def __init__(self, names: list[str] | None = None, auto_load_all: bool = True,
+                 store_kind: str | None = None):
         self._lock = threading.RLock()
         self.indexes: dict[str, idx_mod.LoadedIndex] = {}
+        self.kind = (store_kind or store_mod.store_kind()).lower()
+        self._neo: store_mod.Neo4jStore | None = None
+        if self.kind == "neo4j":
+            # One driver shared by every index; the graph holds one dataset at
+            # a time, so multi-index search does not apply on this backend.
+            self._neo = store_mod.Neo4jStore()
         if names:
-            self.indexes = idx_mod.load_all(names)
+            self.indexes = self._load(names)
         elif auto_load_all:
-            self.indexes = idx_mod.load_all(None)
+            self.indexes = self._load(None)
+
+    def _load(self, names):
+        loaded = idx_mod.load_all(names)
+        if self._neo is not None:
+            for item in loaded.values():
+                item._store = self._neo
+        return loaded
 
     # ---- registry ---------------------------------------------------------
     def reload(self, names: list[str] | None = None) -> list[str]:
         with self._lock:
-            self.indexes = idx_mod.load_all(names)
+            self.indexes = self._load(names)
             return sorted(self.indexes)
 
     def names(self) -> list[str]:

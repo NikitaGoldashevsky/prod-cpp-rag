@@ -179,6 +179,8 @@ class CppOntology:
         self._cur_dir = ""     # directory part of that path
         self._known_classes: set[str] = set()      # prescan: class/struct names
         self._known_namespaces: set[str] = set()   # prescan: namespace names
+        self._out_index: dict | None = None
+        self._adj: tuple | None = None
         self._raw_calls: list[tuple[str, str]] = []
         self._raw_refs: list[tuple[str, str]] = []
 
@@ -224,11 +226,17 @@ class CppOntology:
         self._build_one(source_text, filename, namespace)
         return self
 
-    def finish(self):
-        """Resolve cross-file calls and rebuild chunks/index after all files."""
+    def finish(self, with_retriever: bool = True):
+        """Resolve cross-file calls and rebuild chunks/index after all files.
+
+        `with_retriever=False` skips the BM25 index (the expensive part on large
+        trees) when the caller hands the graph to a database that does its own
+        lexical search.
+        """
         self._resolve_calls_and_refs()
         self._finalise_chunks()
-        self.build_retriever()
+        if with_retriever:
+            self.build_retriever()
         return self
 
     def _build_one(self, source_text: str, filename: str, namespace: str = ""):
@@ -343,6 +351,40 @@ class CppOntology:
 
     def _rel(self, s: str, p: str, o: str, literal: bool = False):
         self.relations.append(Relation(s, p, o, literal))
+        self._out_index = None          # invalidate the adjacency caches
+        self._adj = None
+
+    def _out(self, subject: str, predicate: str) -> list[str]:
+        """Objects of `subject --predicate--> ?`, from a cached adjacency map.
+
+        `_card()` used to scan the whole relation list four to six times per
+        entity. On 500 files / 185k lines that is O(entities x relations) and
+        took minutes; this makes it O(1) per lookup after one build.
+        """
+        idx = self._out_index
+        if idx is None:
+            idx = {}
+            for r in self.relations:
+                idx.setdefault(r.s, {}).setdefault(r.p, []).append(r.o)
+            self._out_index = idx
+        return idx.get(subject, {}).get(predicate, [])
+
+    def _adjacency(self):
+        """(outgoing, incoming) maps over non-literal edges, cached.
+
+        Graph traversal used to rescan every relation for every frontier node,
+        which is quadratic in both relations and hop count.
+        """
+        if self._adj is None:
+            out: dict[str, list[str]] = {}
+            inc: dict[str, list[str]] = {}
+            for r in self.relations:
+                if r.literal:
+                    continue
+                out.setdefault(r.s, []).append(r.o)
+                inc.setdefault(r.o, []).append(r.s)
+            self._adj = (out, inc)
+        return self._adj
 
     def _handle_include(self, node):
         path = None
@@ -621,32 +663,50 @@ class CppOntology:
                 self._raw_refs.append((caller_id, _text(self.src_bytes, desc)))
 
     def _resolve_calls_and_refs(self):
+        # Suffix lookup table: "::callee" -> [ids]. Built once instead of
+        # scanning every qualified name per unresolved call, which is O(calls x
+        # entities) and dominates build time on large trees (measured: minutes
+        # for 500 files / 185k lines, seconds after this).
+        by_suffix: dict[str, list[str]] = {}
+        for qname, idlist in self._by_qname.items():
+            idx = qname.rfind("::")
+            if idx != -1:
+                by_suffix.setdefault(qname[idx + 2:], []).extend(idlist)
+
+        seen_calls: set[tuple[str, str]] = set()
+
         for caller, callee in self._raw_calls:
-            local = self._resolve_call(callee, self._caller_file(caller))
+            local = self._resolve_call(callee, self._caller_file(caller), by_suffix)
             if local:
                 self._rel(caller, "calls", local)
+                seen_calls.add((caller, local))
             else:
                 self._rel(caller, "callsExternal", callee, literal=True)
+
         for caller, ref in self._raw_refs:
-            local = self._resolve_call(ref, self._caller_file(caller))
-            if local and not any(r.s == caller and r.p == "calls" and r.o == local
-                                 for r in self.relations):
+            local = self._resolve_call(ref, self._caller_file(caller), by_suffix)
+            # a `references` edge is redundant when the same pair already has a
+            # `calls` edge; a set makes that check O(1) instead of a scan.
+            if local and (caller, local) not in seen_calls:
                 self._rel(caller, "references", local)
 
     def _caller_file(self, entity_id: str):
         e = self.entities.get(entity_id)
         return e.file if e else None
 
-    def _resolve_call(self, callee: str, caller_file: str | None = None):
+    def _resolve_call(self, callee: str, caller_file: str | None = None,
+                      by_suffix: dict[str, list[str]] | None = None):
         # exact qualified / bare-name match, then "method of some class"
         hit = self._pick_entity(self._by_qname.get(callee, []), caller_file)
         if hit:
             return hit
-        cands = []
-        for q, idlist in self._by_qname.items():
-            if q.endswith("::" + callee):
-                cands.extend(idlist)
-        return self._pick_entity(cands, caller_file)
+        if by_suffix is None:            # direct callers (tests) still work
+            by_suffix = {}
+            for q, idlist in self._by_qname.items():
+                idx = q.rfind("::")
+                if idx != -1:
+                    by_suffix.setdefault(q[idx + 2:], []).extend(idlist)
+        return self._pick_entity(by_suffix.get(callee, []), caller_file)
 
     def _pick_entity(self, ids, caller_file):
         """Disambiguate a set of same-named entities. Prefers the one defined in
@@ -736,11 +796,10 @@ class CppOntology:
                 bits.append("modifiers: " + ", ".join(flags))
             if e.parent:
                 bits.append(f"member of {self.entities[e.parent].name if e.parent in self.entities else e.parent}")
-            calls = [self._label(o) for r in self.relations
-                     if r.s == e.id and r.p == "calls" for o in [r.o]]
-            refs = [self._label(r.o) for r in self.relations if r.s == e.id and r.p == "references"]
-            ext = [r.o for r in self.relations if r.s == e.id and r.p == "callsExternal"]
-            inits = [self._label(r.o) for r in self.relations if r.s == e.id and r.p == "initializes"]
+            calls = [self._label(o) for o in self._out(e.id, "calls")]
+            refs = [self._label(o) for o in self._out(e.id, "references")]
+            ext = self._out(e.id, "callsExternal")
+            inits = [self._label(o) for o in self._out(e.id, "initializes")]
             if calls:
                 bits.append("calls: " + ", ".join(sorted(set(calls))))
             if refs:
@@ -766,11 +825,12 @@ class CppOntology:
             tail = f"; lines {e.line_start}-{e.line_end}." if e.line_start else "."
             return f"[FACT] Field {e.name}{t} belongs to {owner}{tail}"
         if e.kind == "Class" or e.kind == "Struct":
-            methods = [self.entities[r.o].name for r in self.relations
-                       if r.s == e.id and r.p in ("hasMethod", "hasConstructor") and r.o in self.entities]
-            fields = [self.entities[r.o].name for r in self.relations
-                      if r.s == e.id and r.p == "hasField" and r.o in self.entities]
-            bases = [r.o for r in self.relations if r.s == e.id and r.p == "inheritsFrom"]
+            methods = [self.entities[o].name
+                       for o in self._out(e.id, "hasMethod") + self._out(e.id, "hasConstructor")
+                       if o in self.entities]
+            fields = [self.entities[o].name for o in self._out(e.id, "hasField")
+                      if o in self.entities]
+            bases = self._out(e.id, "inheritsFrom")
             bits = [f"{e.kind} {e.name}"]
             if bases:
                 bits.append("inherits " + ", ".join(bases))
@@ -849,13 +909,15 @@ class CppOntology:
         frontier = list(entity_ids)
         for _ in range(hops):
             nxt = []
+            out_map, in_map = self._adjacency()
             for nid in frontier:
                 # outgoing (except callsExternal literals)
-                for r in self.relations:
-                    if r.s == nid and not r.literal and r.o in self.entities and r.o not in seen:
-                        nxt.append(r.o); seen.add(r.o)
-                    if r.o == nid and not r.literal and r.s in self.entities and r.s not in seen:
-                        nxt.append(r.s); seen.add(r.s)
+                for o in out_map.get(nid, ()):
+                    if o in self.entities and o not in seen:
+                        nxt.append(o); seen.add(o)
+                for s_ in in_map.get(nid, ()):
+                    if s_ in self.entities and s_ not in seen:
+                        nxt.append(s_); seen.add(s_)
             frontier = nxt
             result.extend(nxt)
         return result
@@ -1322,7 +1384,8 @@ def build_from_file(path: str) -> CppOntology:
     return onto
 
 
-def build_from_files(paths: list[str], root: str | None = None) -> CppOntology:
+def build_from_files(paths: list[str], root: str | None = None,
+                     with_retriever: bool = True) -> CppOntology:
     """Build one ontology over several C/C++ source files (multi-file mode).
 
     Pass `paths` relative to `root` (with `root` set) so entity ids and chunk
@@ -1342,10 +1405,10 @@ def build_from_files(paths: list[str], root: str | None = None) -> CppOntology:
         onto.prescan(text)
     for rel, text in texts:       # pass 2: full extraction
         onto.add_file(text, rel)
-    return onto.finish()
+    return onto.finish(with_retriever=with_retriever)
 
 
-def build_from_dir(root: str, exts=CPP_EXTS) -> CppOntology:
+def build_from_dir(root: str, exts=CPP_EXTS, with_retriever: bool = True) -> CppOntology:
     """Recursively collect C/C++ files under `root` and build one ontology.
 
     Files are namespaced by their directory relative to `root`, so the ids do
@@ -1357,7 +1420,7 @@ def build_from_dir(root: str, exts=CPP_EXTS) -> CppOntology:
             if fn.lower().endswith(exts):
                 rel = os.path.relpath(os.path.join(dirpath, fn), root)
                 paths.append(rel.replace("\\", "/"))
-    return build_from_files(paths, root=root)
+    return build_from_files(paths, root=root, with_retriever=with_retriever)
 
 
 if __name__ == "__main__":

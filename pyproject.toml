@@ -14,6 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.2"]
+neo4j = ["neo4j>=5.20"]
 
 [project.scripts]
 prod-rag = "prod_rag.cli:main"

@@ -18,7 +18,8 @@ package was missing; do not attempt workarounds that modify system Python.
 |---|---|
 | Repo location | ask the human, or use `~/PROD_RAG` |
 | Python needed | 3.10+ (Ubuntu 22.04 ships 3.10 — fine) |
-| Dependencies | `tree-sitter`, `tree-sitter-cpp`, `mcp` — all wheels, no compiler |
+| Dependencies | `tree-sitter`, `tree-sitter-cpp`, `mcp`, `neo4j` — all wheels, no compiler |
+| Neo4j | **required**; see step 2 |
 | Source code touched | **none** — PROD_RAG is read-only on the codebase |
 | State written | `~/.local/share/prod-rag/` (indexes only) |
 | Network | none required at runtime; the model is optional |
@@ -42,21 +43,45 @@ in editable mode. It needs no root.
 ```
 
 Expected: it prints the Python version, `tree_sitter` and `mcp` versions, the
-data dir, and `indexes 0`. It exits non-zero only when no index exists yet — that
-is expected at this point.
+active store, the data dir, and `indexes 0`. It exits non-zero only when no index
+exists yet — that is expected at this point.
 
 If `python3 -m venv` fails: `sudo apt-get install -y python3-venv`, then rerun.
 
 ---
 
-## 2. Build the first index
+## 2. Ensure Neo4j is running
+
+The graph lives in Neo4j. Check first, install only if missing.
+
+```bash
+cd <repo> && ./.venv/bin/prod-rag neo4j status
+```
+
+- Prints `uri` and `counts` → it is running, go to step 3.
+- `Neo4j not reachable` → install it:
+
+  ```bash
+  bash ./neo4j_setup.sh                  # no root, no Docker; ~1.2 GB, ships a JDK
+  setsid nohup ~/.local/bin/neo4j-local console > /tmp/neo4j-console.log 2>&1 &
+  sleep 20 && ./.venv/bin/prod-rag neo4j status
+  ```
+
+  Credentials are generated into `~/.local/opt/neo4j/credentials.env` (mode 600)
+  and read automatically. **Verify:** `neo4j status` prints a `uri` line and
+  non-zero counts, or zeros if the graph is empty.
+
+If the machine already has Neo4j, export `NEO4J_URI`, `NEO4J_USER`,
+`NEO4J_PASSWORD` instead of installing anything.
+
+## 3. Build the first index
 
 Ask the human which submodule to start with. **Index one submodule, not the whole
 monorepo** — the full tree is too large and the first index should be quick to
 validate.
 
 ```bash
-./.venv/bin/prod-rag index add <short-name> <absolute-path-to-submodule>
+./.venv/bin/prod-rag index add <short-name> <absolute-path-to-submodule> --store neo4j
 ```
 
 Naming: short, lowercase, no spaces — `core`, `network`, `app`. It becomes the
@@ -76,20 +101,21 @@ no C/C++ files — report that instead of guessing.
 Useful flags when a subtree contains vendored code:
 
 ```bash
-./.venv/bin/prod-rag index add core <path> --exclude third_party --exclude build
+./.venv/bin/prod-rag index add core <path> --store neo4j \
+    --exclude third_party --exclude build
 ```
 
 ---
 
-## 3. Sanity-check retrieval before wiring anything up
+## 4. Sanity-check retrieval before wiring anything up
 
 Run these two and read the output. The first should return chunks and ontology
 facts from the submodule you indexed; the second should print a full entity
 record.
 
 ```bash
-./.venv/bin/prod-rag search "<a question a new developer would ask>"
-./.venv/bin/prod-rag entity <a symbol you know exists, e.g. Class::method>
+./.venv/bin/prod-rag search "<a question a new developer would ask>" --store neo4j
+./.venv/bin/prod-rag entity <a symbol you know exists, e.g. Class::method> --store neo4j
 ```
 
 **Verify:** the search output contains a `[FACT]` line and at least one code
@@ -101,7 +127,7 @@ submodule was indexed but that symbol lives elsewhere; report it.
 
 ---
 
-## 4. Register the MCP server with your harness
+## 5. Register the MCP server with your harness
 
 The server command is:
 
@@ -117,7 +143,7 @@ harness provides. Canonical JSON (`examples/mcp-config.json`):
   "mcpServers": {
     "prod-rag": {
       "command": "/home/YOU/PROD_RAG/.venv/bin/prod-rag",
-      "args": ["mcp"]
+      "args": ["mcp", "--store", "neo4j"]
     }
   }
 }
@@ -157,7 +183,7 @@ built-in authentication — do not expose it beyond a trusted network.
 
 ---
 
-## 5. Optional: the web UI
+## 6. Optional: the web UI
 
 ```bash
 <repo>/.venv/bin/prod-rag serve --port 8088
@@ -173,7 +199,7 @@ shows a per-folder table with `fresh` rows.
 
 ---
 
-## 6. How to use the tools yourself from now on
+## 7. How to use the tools yourself from now on
 
 1. Call `list_indexes()` once to see what exists.
 2. `search_code("<question>")` for anything about behaviour or location.
@@ -197,12 +223,13 @@ index_status("<name>")      -> state: stale, with the changed files
 reindex("<name>")           -> rebuild (touches only the index, never the source)
 ```
 
-`reindex` re-parses the whole indexed subtree. It is fast (fractions of a second
-for a small submodule, ~1.5 s for 600 files) but not incremental.
+`reindex` re-parses the whole indexed subtree and, with `PROD_RAG_STORE=neo4j`,
+re-pushes it to the graph. Fractions of a second for a small submodule, ~31 s for
+500 files / 185k lines. Not incremental.
 
 ---
 
-## 7. Adding another submodule later
+## 8. Adding another submodule later
 
 ```bash
 prod-rag index add <name> <path>
@@ -214,10 +241,11 @@ button per index, but new indexes also need a restart.
 
 ---
 
-## 8. What to report back
+## 9. What to report back
 
 - The exact commands you ran, in order.
 - `prod-rag doctor` output.
+- `prod-rag neo4j status` output (uri + counts).
 - The index name(s), root path(s), and the file/entity/chunk counts.
 - Whether the three MCP verification calls in step 4 succeeded, quoting one
   result.
@@ -230,6 +258,8 @@ button per index, but new indexes also need a restart.
 
 - Never run `sudo pip install`, never modify the system Python, never disable
   the virtualenv.
+- Never point `NEO4J_URI` at a shared or production database. `neo4j push`
+  wipes `:Entity`/`:Chunk` unless `--keep` is given.
 - This tool reads source code and writes indexes. If a step appears to require
   editing the codebase, stop — that is not part of this setup.
 - Do not index a directory the human did not name.
