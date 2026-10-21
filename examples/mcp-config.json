@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "prod-rag": {
+      "command": "/home/YOU/PROD_RAG/.venv/bin/prod-rag",
+      "args": ["mcp"],
+      "env": {
+        "PROD_RAG_DATA": "/home/YOU/.local/share/prod-rag"
+      }
+    }
+  }
+}

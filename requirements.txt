@@ -1,0 +1,5 @@
+# Runtime (all pure-Python or wheel-only; no compiler needed)
+tree-sitter>=0.22
+tree-sitter-cpp>=0.22
+# MCP server (optional at runtime: the web UI and CLI work without it)
+mcp>=1.2
