@@ -98,7 +98,7 @@ prod-rag-web    the web UI      (same as `prod-rag serve`)
 Add it to your PATH:
 
 ```bash
-export PATH="$HOME/PROD_RAG/.venv/bin:$PATH"
+export PATH="$HOME/prod-cpp-rag/.venv/bin:$PATH"
 ```
 
 Verify:
