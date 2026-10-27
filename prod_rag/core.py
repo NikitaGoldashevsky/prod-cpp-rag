@@ -72,6 +72,49 @@ def tokenize_code(text: str) -> list[str]:
     return toks
 
 
+# Qt's class-body macros are not C++ that tree-sitter can parse: `Q_OBJECT`
+# followed by `public:` produced ERROR nodes and swallowed the next member
+# declaration outright, and `Q_PROPERTY(int a READ a)` became a method named
+# Q_PROPERTY. They are blanked out *before* parsing, in place and at the same
+# byte length, so node offsets still point at the real source.
+_QT_MACRO_STMT = re.compile(
+    r"\b(?:Q_OBJECT|Q_GADGET|Q_ENUM|Q_ENUM_NS|Q_FLAG|Q_FLAG_NS|Q_NAMESPACE|"
+    r"Q_PROPERTY|Q_CLASSINFO|Q_INTERFACES|Q_DECLARE_INTERFACE|"
+    r"Q_DECLARE_METATYPE|Q_DECLARE_PRIVATE|Q_DECLARE_PUBLIC|Q_DISABLE_COPY|"
+    r"Q_DISABLE_COPY_MOVE|Q_INVOKABLE|Q_SIGNALS|Q_SLOTS|QT_REQUIRE_CONFIG)\b")
+_QT_ACCESS_LABEL = re.compile(r"(?<=[\s;{}])|^")
+
+
+def _parse_bytes(text: str) -> bytes:
+    """Bytes to hand the parser: macros blanked, length preserved."""
+    return _blank_qt_macros(text).encode("utf-8")
+
+
+def _blank_qt_macros(text: str) -> str:
+    """Replace Qt macro invocations with spaces, preserving length and lines."""
+    def blank(m):
+        return " " * (m.end() - m.start())
+    out = []
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        indent = line[:len(line) - len(stripped)]
+        code = stripped
+        # `signals:` / `slots:` / `public slots:` -> keep the access word only
+        m = re.match(r"((?:public|private|protected)\s+)?(signals|slots)\s*:(.*)$",
+                     code)
+        if m:
+            head = m.group(1) or ""
+            code = head + " " * len(m.group(2)) + ":" + m.group(3)
+        # a line that is nothing but a macro invocation (optionally with args)
+        m = re.match(r"(Q_[A-Z_]+)\s*(\(.*\))?\s*;?\s*$", code)
+        if m and _QT_MACRO_STMT.fullmatch(m.group(1)):
+            code = " " * len(code)
+        else:
+            code = _QT_MACRO_STMT.sub(blank, code)
+        out.append(indent + code)
+    return "\n".join(out)
+
+
 def _text(src: bytes, node) -> str:
     return src[node.start_byte:node.end_byte].decode("utf-8", "replace").strip()
 
@@ -201,7 +244,7 @@ class CppOntology:
         namespace function rather than a method of a class `config`."""
         try:
             src = source_text.encode("utf-8")
-            root = _PARSER.parse(src).root_node
+            root = _PARSER.parse(_parse_bytes(source_text)).root_node
         except Exception:
             return
         for n in _walk(root):
@@ -261,8 +304,12 @@ class CppOntology:
         if rel not in self.files:
             self.files.append(rel)
         self.src = source_text
+        # Every text extraction reads the ORIGINAL bytes; parsing uses the
+        # macro-blanked form. The blanking is length-preserving, so a node
+        # offset from the blanked parse selects the same source span -- which
+        # is why chunks still show real code, macros included.
         self.src_bytes = source_text.encode("utf-8")
-        root = _PARSER.parse(self.src_bytes).root_node
+        root = _PARSER.parse(_parse_bytes(source_text)).root_node
 
         file_ent = Entity(id=self._cur_file_id, kind="File", name=stem, file=rel)
         self._add(file_ent)
@@ -566,28 +613,71 @@ class CppOntology:
         if not body:
             return
         current_access = "private" if kind == "Class" else "public"
-        for child in body.children:
-            if child.type == "access_specifier":
-                m = re.match(r"(public|private|protected)", _text(self.src_bytes, child))
-                if m:
-                    current_access = m.group(1)
-            elif child.type == "field_declaration":
-                # an in-class member: a method declaration (has a function
-                # declarator) or a data field
+        self._class_members(body.children, cid, name, current_access)
+
+    # `public slots:` / `signals:` / `Q_SLOTS:` are access labels with a macro
+    # in them; tree-sitter sees a field_declaration that swallows the following
+    # member, which is how `void hide(int)` after `public slots:` disappeared
+    # and a field called `public` appeared instead.
+    _ACCESS_LABEL = re.compile(
+        r"^\s*(?:(public|private|protected)\s*:?\s*)?"
+        r"(?:slots|signals|Q_SLOTS|Q_SIGNALS|Q_INVOKABLE)?\s*:\s*$", re.S)
+    # Bare Qt macros that are statements, not declarations.
+    _MACRO_STMT = re.compile(r"^\s*(Q_OBJECT|Q_GADGET|Q_ENUM\w*|Q_FLAG\w*|"
+                             r"Q_DECLARE_\w+|Q_DISABLE_COPY\w*|Q_INTERFACES\w*|"
+                             r"Q_PROPERTY\s*\(|Q_CLASSINFO\s*\()")
+
+    def _class_members(self, children, cid: str, cls_name: str, access: str):
+        """Extract members from a class body, surviving Qt's macros."""
+        for child in children:
+            if child.type in ("access_specifier", "ERROR", ":", ";", "{", "}"):
+                if child.type == "access_specifier":
+                    m = re.match(r"(public|private|protected)",
+                                 _text(self.src_bytes, child))
+                    if m:
+                        access = m.group(1)
+                elif child.type == "ERROR":
+                    m = re.match(r"(public|private|protected)\s*(?:slots|signals)?\s*:",
+                                 _text(self.src_bytes, child))
+                    if m:
+                        access = m.group(1)
+                continue
+            if child.type in self._COND_WRAPPERS:
+                # `#ifdef` inside a class body: its declarations are members too
+                kids = [c for c in child.children
+                        if not c.type.startswith("preproc")]
+                self._class_members(kids, cid, cls_name, access)
+                continue
+            if child.type in ("template_declaration",):
+                inner = [c for c in child.children
+                         if c.type in ("class_specifier", "struct_specifier",
+                                       "function_definition", "declaration",
+                                       "field_declaration")]
+                self._class_members(inner, cid, cls_name, access)
+                continue
+            text = _text(self.src_bytes, child)
+            if child.type in ("field_declaration", "declaration"):
+                if self._ACCESS_LABEL.match(text):
+                    m = re.match(r"(public|private|protected)", text)
+                    if m:
+                        access = m.group(1)
+                    continue
+                # A macro statement such as `Q_OBJECT` or `Q_PROPERTY(...)`.
+                # Left unhandled it became a bogus Field or Method named after
+                # the macro.
+                if self._MACRO_STMT.match(text) and not _has_descendant(
+                        child, "function_declarator"):
+                    m = re.match(r"(public|private|protected)", text)
+                    if m and self._ACCESS_LABEL.match(text.split("\n")[0]):
+                        access = m.group(1)
+                    continue
                 if _has_descendant(child, "function_declarator"):
-                    self._handle_method_declaration(child, cid, name, current_access)
+                    self._handle_method_declaration(child, cid, cls_name, access)
                 else:
-                    self._handle_field(child, cid, name, current_access)
+                    self._handle_field(child, cid, cls_name, access)
             elif child.type == "function_definition":
-                self._handle_function(child, owner_class=name, owner_id=cid,
-                                      access=current_access)
-            elif child.type == "declaration":
-                # inline member function declaration or member variable
-                if any(c.type == "function_declarator" for c in child.children) or \
-                   _has_descendant(child, "function_declarator"):
-                    self._handle_method_declaration(child, cid, name, current_access)
-                else:
-                    self._handle_field(child, cid, name, current_access)
+                self._handle_function(child, owner_class=cls_name, owner_id=cid,
+                                      access=access)
 
     def _handle_field(self, node, cls_id, cls_name, access):
         # could declare several identifiers: int a, b;
@@ -781,7 +871,10 @@ class CppOntology:
         for desc in _walk(node):
             if desc.type == "declaration":
                 tnode = _child_by_field(desc, "type")
-                tname = _normalize_type(_text(self.src_bytes, tnode)) if tnode else ""
+                # Keep the raw text: `_normalize_type` strips template arguments,
+                # and `QList<NotifyClocks*>` truncated to `QList` loses the very
+                # element type that makes `clocks[i]->working()` resolvable.
+                tname = _text(self.src_bytes, tnode) if tnode else ""
                 if tname:
                     try:
                         decls = desc.children_by_field_name("declarator")
@@ -933,8 +1026,30 @@ class CppOntology:
                 hit = self._member_of(cls, name, members, bases, nargs, ctx)
                 if hit:
                     return hit
-            # namespace-qualified free function defined without its namespace
-            return self._pick_entity(self._by_qname.get(name, []), caller_file)
+                # The class is known but has no such member: it is inherited
+                # from something outside the index, or a base we could not
+                # resolve. Do NOT fall back to a same-named free function.
+                return None
+            # `Owner` is not a class we know. A namespace-qualified free
+            # function is the remaining real possibility, so accept one only if
+            # it is in the owner's namespace or unique corpus-wide -- never a
+            # bare homonym. `NvDateTime::str2time(...)` used to bind to an
+            # unrelated file-static `str2time` in another module.
+            frees = [i for i in self._by_qname.get(callee, [])
+                     if i in self.entities and self.entities[i].kind == "Function"]
+            if frees:
+                return self._pick_entity(frees, caller_file)
+            # `ns::fn()` where the namespace is real: the function may be
+            # recorded under its bare name if the namespace was not part of the
+            # declaration site.
+            if owner in self._known_namespaces and owner not in self._known_classes:
+                frees = [i for i in self._by_qname.get(name, [])
+                         if i in self.entities and self.entities[i].kind == "Function"]
+                return self._pick_entity(frees, caller_file)
+            # Unknown qualifier: a member of a class outside the index, or a
+            # type we could not resolve. Either way, a same-named free function
+            # is a different thing; say "external" instead of inventing it.
+            return None
 
         # bare name: own class scope first, then its bases — unless the call
         # asked for global scope explicitly
@@ -954,9 +1069,26 @@ class CppOntology:
                                        bases, nargs, ctx)
                 return ctor or cls
 
-        # free functions: same file, then same directory
+        # A member of a class with an out-of-tree base may be calling an
+        # inherited method we cannot see, so a bare name that matches only a
+        # *header declaration* of a free function is more likely a member of
+        # that base than a global. On a real submodule this turned `hide(2)`
+        # into a call to a `hide` declared in an unrelated header. A free
+        # function that actually has a body in the corpus is unambiguous, so it
+        # still resolves.
+        unknown_base = (caller is not None and caller.parent in self.entities
+                        and any(b not in ctx["classes"]
+                                for b in bases.get(caller.parent, [])))
+
+        # free functions: same file, then same directory; overloads by arity
         cands = [i for i in self._by_qname.get(callee, [])
                  if i in self.entities and self.entities[i].kind == "Function"]
+        if unknown_base:
+            cands = [i for i in cands if self.entities[i].is_definition]
+        if len(cands) > 1 and nargs >= 0:
+            exact = [i for i in cands if len(self.entities[i].params) == nargs]
+            if exact:
+                cands = exact
         hit = self._pick_entity(cands, caller_file)
         if hit:
             return hit
@@ -967,6 +1099,8 @@ class CppOntology:
         # exactly that false edge on a real 667-file submodule.
         uniq = {i for i in ctx["by_suffix"].get(callee, [])
                 if i in self.entities and self.entities[i].kind == "Function"}
+        if unknown_base:
+            uniq = {i for i in uniq if self.entities[i].is_definition}
         if len(uniq) == 1:
             return next(iter(uniq))
         return None
@@ -1861,20 +1995,32 @@ def _parse_params(src: bytes, fd) -> list[dict]:
     if plist is None:
         return params
     for c in plist.children:
-        if c.type == "parameter_declaration":
-            txt = _text(src, c)
-            name = ""
-            # find the declared name: last identifier that's not a type keyword
-            ids = [d for d in _walk(c) if d.type in ("identifier", "field_identifier")]
-            # declared name is typically the last identifier in a parameter
-            if ids:
-                name = _text(src, ids[-1])
-            # type = text minus the trailing name
-            typ = txt
-            if name and txt.rstrip().endswith(name):
-                typ = txt[:txt.rfind(name)].strip()
-            typ = re.sub(r"\s+", " ", typ)
-            params.append({"name": name, "type": typ or txt, "code": txt})
+        # `bool status = false` is an optional_parameter_declaration, and it was
+        # simply skipped: `explicit A(bool status = false)` recorded no
+        # parameters at all, so every such overload looked like `A()` and they
+        # all collapsed into one entity.
+        if c.type == "...":
+            params.append({"name": "...", "type": "...", "code": "..."})
+            continue
+        if c.type not in ("parameter_declaration", "optional_parameter_declaration",
+                          "variadic_parameter_declaration"):
+            continue
+        txt = _text(src, c)
+        # the default value is not part of the type
+        clean = re.sub(r"\s*=\s*.*$", "", txt, flags=re.S).strip()
+        if c.type == "variadic_parameter_declaration":
+            params.append({"name": "...", "type": "...", "code": txt})
+            continue
+        name = ""
+        # find the declared name: last identifier in the parameter
+        ids = [d for d in _walk(c) if d.type in ("identifier", "field_identifier")]
+        if ids and _text(src, ids[-1]) not in clean.split("=")[0].split()[:1]:
+            name = _text(src, ids[-1])
+        typ = clean
+        if name and clean.rstrip().endswith(name):
+            typ = clean[:clean.rfind(name)].strip()
+        typ = re.sub(r"\s+", " ", typ)
+        params.append({"name": name, "type": typ or clean, "code": txt})
     return params
 
 
@@ -1921,20 +2067,33 @@ def _external_label(callee: str) -> str:
 
     `uses` is shown to humans and to models, so raw expression text with
     embedded newlines (`QString("%1")\n   .arg(...)`) is unreadable and looks
-    like a defect. A receiver we do have (`res.append`, `ip_.c_str`) is kept:
-    that is the useful part. Anything else collapses to the method name.
+    like a defect. What is kept is the last *named* hop, so the reader can see
+    where the call came from:
+
+        res.append                      -> res.append
+        rec->getSettings()->GLNPcode(x)  -> getSettings()->GLNPcode
+        QString("%1").arg(x).arg(y)      -> arg
     """
     t = " ".join((callee or "").split())
     if not t:
         return t
-    if "(" in t or len(t) > 60:
-        hits = list(re.finditer(r"(?:\.|->)\s*(~?[A-Za-z_]\w*)", t))
-        if hits:
-            return hits[-1].group(1)
-        m = re.match(r"^(~?[A-Za-z_]\w*)", t)
-        if m:
-            return m.group(1)
-    return t
+    if "(" not in t and len(t) <= 60:
+        return t
+    hops = list(re.finditer(r"(\.|->)\s*(~?[A-Za-z_]\w*)", t))
+    if not hops:
+        # no member access at all: `std::to_string(x)` -> `to_string`, `f(1)` -> `f`
+        head = t.split("(", 1)[0]
+        return head.split("::")[-1].strip() or t
+    last = hops[-1]
+    if len(hops) >= 2:
+        prev = hops[-2]
+        gap = t[prev.end():last.start()]
+        # keep a receiver hop only when it is a plain name or a plain call:
+        # `getSettings()->M` -> getSettings()->M ; `"".arg()...` -> no receiver
+        if gap.strip() in ("", "()"):
+            return f"{prev.group(2)}{gap.strip()}{last.group(1)}{last.group(2)}"
+    return last.group(2)
+
 
 
 def _element_type(type_text: str) -> str:

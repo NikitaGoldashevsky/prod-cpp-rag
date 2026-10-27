@@ -465,11 +465,24 @@ The parser now recurses through include guards, `#if` conditionals, namespaces,
 `extern "C"` blocks and template wrappers, and handles `typedef struct {...} X;`.
 Effect on `cct-app`: free functions found 24 → 30, global-block noise 48 → 28.
 
+Qt's class-body macros are a separate parse hazard: `Q_OBJECT` followed by
+`public:` produced `ERROR` nodes and swallowed the *next member declaration*,
+`Q_PROPERTY(int a READ a)` became a method named `Q_PROPERTY`, and
+`public slots:` became a field named `public`. Those macro invocations are now
+blanked out **before parsing** — in place, at the same byte length — so node
+offsets still select the original source. Chunks and fact cards show the real
+text, macros included; only the parser sees the blanks. `explicit A(bool b = false)`
+also lost its parameter (it is an `optional_parameter_declaration`), which made
+every defaulted overload look like `A()` and collapse into one entity.
+
 Measured, before → after:
 
-- **Qt-shaped corpus** (guarded headers, namespaces, pointer and container
-  receivers, one shared method vocabulary so name matching cannot be right by
-  accident): recall **0.429 → 1.000**, precision **1.000 → 1.000**.
+- **Qt-shaped corpus** (guarded headers, `Q_OBJECT`/`slots`/`signals`,
+  `Q_PROPERTY`, default arguments, an out-of-tree base, a local
+  `QList<T*>` of project types, one shared method vocabulary so name matching
+  cannot be right by accident): recall **0.571 → 1.000**, precision **1.000**.
+- **Container corpus** (guarded headers, namespaces, pointer and container
+  receivers): recall **0.429 → 1.000**, precision **1.000**.
 - **Collision corpus** (same-named methods in every class, inheritance chains,
   explicit `::` calls): precision **0.857 → 1.000**, recall **0.750 → 1.000**.
 - **`cct-app`**: the edges that changed were the bad ones —
@@ -517,6 +530,10 @@ you change it, change it there too and re-run the parity check.
   call through an unknown variable is reported as external rather than guessed,
   and overrides are not linked to the base declaration. Treat `calls`/`callers`
   as strong evidence and confirm with the source when the answer turns on it.
+- **A class with a base outside the index is treated cautiously.** Inside such
+  a class, a bare call is not bound to a header-declared free function of the
+  same name — it may well be an inherited member we cannot see, so it is
+  reported as external. A free function that has a body still resolves.
 - **Generic words can drown specific ones.** In a large project, "client" may
   link a field named `client_` before the class that actually answers the
   question. Prefer naming the symbol.

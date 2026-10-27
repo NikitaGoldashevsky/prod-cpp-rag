@@ -208,6 +208,79 @@ void ComplexTimer2::fromString() {
 }
 """
 
+# A Qt form header: Q_OBJECT, Q_PROPERTY, public slots:, signals:, and a base
+# class that lives outside the indexed tree. Before macro blanking, the parser
+# produced ERROR nodes here and lost the member that followed each macro.
+QT_HEADER = r"""
+#ifndef QTFORM_H
+#define QTFORM_H
+
+class QtForm : public NvOutOfTreeBase
+{
+    Q_OBJECT
+    Q_PROPERTY(int value READ value)
+
+public:
+    explicit QtForm(QWidget* parent = nullptr);
+    void run();
+    void working();
+
+public slots:
+    void hide(int mode);
+    void settle();
+
+signals:
+    void changed();
+
+protected:
+    void keyPressEvent(QKeyEvent* e);
+
+private:
+    int value_;
+};
+
+class Widget0 { public: void run(); void working(); };
+class Widget1 { public: void run(); void working(); };
+
+class QtMgr
+{
+public:
+    void timerEvent();
+    void working();
+private:
+    void onTick();
+};
+
+#endif
+"""
+
+QT_SOURCE = r"""
+#include "qtform.h"
+
+QtForm::QtForm(QWidget* parent) {}
+void QtForm::run() { working(); qtHelper(); }
+void QtForm::working() {}
+void QtForm::hide(int mode) { settle(); }
+void QtForm::settle() {}
+void QtForm::keyPressEvent(QKeyEvent* e) { base::keyPressEvent(e); }
+
+void Widget0::run() {}
+void Widget0::working() {}
+void Widget1::run() {}
+void Widget1::working() {}
+
+void QtMgr::working() {}
+void QtMgr::timerEvent() {
+    QList<Widget0*> forms = findChildren<Widget0*>();
+    forms[i]->run();
+    forms[i]->working();
+    working();
+}
+void QtMgr::onTick() { hide(2); }
+
+void qtHelper() {}
+"""
+
 TEXTFORM = r"""
 class TextForm {
 public:
@@ -227,6 +300,10 @@ def build(tmp: str):
         f.write(SOURCE)
     with open(os.path.join(root, "textform.cpp"), "w") as f:
         f.write(TEXTFORM)
+    with open(os.path.join(root, "qtform.h"), "w") as f:
+        f.write(QT_HEADER)
+    with open(os.path.join(root, "qtform.cpp"), "w") as f:
+        f.write(QT_SOURCE)
     with open(os.path.join(root, "notify_extra.h"), "w") as f:
         f.write(GUARDED)
     with open(os.path.join(root, "notify_extra.cpp"), "w") as f:
@@ -341,6 +418,46 @@ def run(tmp: str) -> int:
         print("  FAIL  template class Box lost its base class")
         ok = False
     print("  OK    guarded header: classes, line numbers, inheritance")
+
+    # ---- Qt macros must not eat members --------------------------------
+    for qname in ("QtForm::hide", "QtForm::settle", "QtForm::changed",
+                  "QtForm::keyPressEvent", "QtForm::value_", "QtForm::run"):
+        if not load.entity(qname):
+            print(f"  FAIL  {qname} missing: a Qt macro swallowed it")
+            ok = False
+    for junk in ("QtForm::Q_OBJECT", "QtForm::Q_PROPERTY"):
+        if load.entity(junk):
+            print(f"  FAIL  macro became an entity: {junk}")
+            ok = False
+    e = load.entity("QtForm::QtForm")
+    if not e or not e.get("params"):
+        print(f"  FAIL  constructor lost its default-argument parameter: {e and e.get('params')}")
+        ok = False
+    print("  OK    Q_OBJECT / Q_PROPERTY / slots / signals parse as members")
+
+    # ---- container of pointers, declared as a local --------------------
+    expect("QtMgr::timerEvent", "calls", "Widget0::run")
+    expect("QtMgr::timerEvent", "calls", "Widget0::working")
+    expect("QtMgr::timerEvent", "calls", "QtMgr::working")
+    if "Widget0::run" in (load.entity("QtMgr::timerEvent") or {}).get("uses", []):
+        print("  FAIL  container element type not resolved")
+        ok = False
+
+    # ---- free function with a body still resolves ----------------------
+    expect("QtForm::run", "calls", "qtHelper")
+
+    # ---- out-of-tree base: a bare name is not a header free function ---
+    # `hide(2)` inside QtMgr (no such member, base chain unknown) must not
+    # become a call to a `hide` declared in some other header.
+    e = load.entity("QtMgr::onTick")
+    if e and "hide" in (e.get("calls") or []):
+        print(f"  FAIL  bare name bound to a header free function: {e.get('calls')}")
+        ok = False
+    # ... and `base::keyPressEvent(e)` must not become recursion
+    e = load.entity("QtForm::keyPressEvent")
+    if e and "QtForm::keyPressEvent" in (e.get("calls") or []):
+        print("  FAIL  base::keyPressEvent bound to itself")
+        ok = False
 
     # ---- an overload of itself is not recursion ------------------------
     # `Form::show(int)` calls `show()`. Only one overload exists in the index,

@@ -202,6 +202,20 @@ same-file free functions), never by matching a bare method name. So:
 - If a submodule looks structurally thin — classes with `line_start: 0`, empty
   `inherits` — check whether its headers use `#ifndef` include guards. Older
   builds lost everything inside a guard; rebuild with the current version.
+- Qt headers (`Q_OBJECT`, `Q_PROPERTY`, `public slots:`, `signals:`) parse
+  correctly as of this version. If a member is missing or you see an entity
+  named after a macro, the index predates the fix — rebuild.
+
+### What the graph will not resolve, by design
+
+- Calls through an unknown variable, a temporary, or a return value
+  (`rec->getSettings()->X()`, `QString().arg()`) go to `uses`, with the last
+  named hop kept so you can see where they came from.
+- Inside a class whose base is outside the indexed subtree, a bare name is not
+  bound to a header-declared free function — it may be an inherited member we
+  cannot see. It shows up in `uses` instead. Do not report it as "no call".
+- A class whose header lies outside the subtree reports
+  `declared_in_index: false`; its `first_member` points at real code.
 - Anything it could not resolve appears in `uses` (the `CALLS_EXTERNAL` set) with
   its receiver attached, e.g. `res.append`, `ip_.c_str`, `::connect`. That means
   "outside the indexed tree, or the receiver type is unknown" — **not** "no
