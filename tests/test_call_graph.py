@@ -514,6 +514,42 @@ def check_header_source_split(tmp: str) -> bool:
     return ok
 
 
+OVERLOAD_SRC = r"""
+class Server {
+public:
+    Server(int port, const Vector3& position, int timeout);
+    Server(const Server&) = delete;
+    Server(Server&& other) noexcept;
+    Server& operator=(const Server&) = delete;
+};
+"""
+
+
+def check_overload_identity(tmp: str) -> bool:
+    """Overloads must not collapse just because they normalise alike.
+
+    `const Server&` and `Server&&` both reduce to `Server` once references are
+    stripped for call resolution. Using that as the identity key merged a
+    deleted copy constructor into the move constructor and made it vanish from
+    the graph.
+    """
+    root = os.path.join(tmp, "ovl")
+    os.makedirs(root)
+    with open(os.path.join(root, "server.cpp"), "w") as f:
+        f.write(OVERLOAD_SRC)
+    idx_mod.build("ovl", root, verbose=False)
+    onto = idx_mod.load("ovl").onto
+    ctors = sorted(tuple(p["type"] for p in e.params)
+                   for e in onto.entities.values()
+                   if (e.qname or "") == "Server::Server")
+    want = [("Server&&",), ("const Server&",), ("int", "const Vector3&", "int")]
+    if ctors != want:
+        print(f"  FAIL  constructor overloads collapsed: {ctors}")
+        return False
+    print("  OK    const-ref / rvalue-ref / by-value overloads stay distinct")
+    return True
+
+
 def check_overload_order(tmp: str) -> bool:
     """Same overloads, but the header sorts *before* the .cpp.
 
@@ -816,6 +852,8 @@ def run(tmp: str) -> int:
         ok = False
 
     if not check_header_source_split(tmp):
+        ok = False
+    if not check_overload_identity(tmp):
         ok = False
     if not check_overload_order(tmp):
         ok = False

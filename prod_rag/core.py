@@ -1318,15 +1318,21 @@ class CppOntology:
         def connected(fa: str, fb: str) -> bool:
             return fa == fb or (fa, fb) in pairs
 
-        groups: dict[str, list[str]] = {}
+        groups: dict[tuple, list[str]] = {}
         joinable = ("Class", "Struct", "Method", "Function", "Constructor",
                     "Destructor", "Field", "TypeAlias")
+        callables = ("Method", "Function", "Constructor", "Destructor")
         for eid, e in self.entities.items():
-            if e.kind in joinable and e.qname:
-                groups.setdefault((e.kind, e.qname), []).append(eid)
+            if e.kind not in joinable or not e.qname:
+                continue
+            # Overloads share a qname and must stay separate — the signature is
+            # part of the identity. Without it this pass merged every overload
+            # that happened to live in one file.
+            key = (e.kind, e.qname, _signature(e) if e.kind in callables else None)
+            groups.setdefault(key, []).append(eid)
 
         remap: dict[str, str] = {}
-        for (kind, qname), ids in groups.items():
+        for _key, ids in groups.items():
             if len(ids) < 2:
                 continue
             keep = self._best_of(ids)
@@ -2465,14 +2471,30 @@ def _absorb(keep, other) -> None:
         keep.params = other.params
 
 
+_SIG_NOISE = re.compile(r"\b(const|volatile|register)\b")
+
+
+def _sig_type(text: str) -> str:
+    """A parameter type reduced to its overload-distinguishing form.
+
+    `_normalize_type` throws away `&`, `*` and template arguments because call
+    resolution only needs the class name — but as an *identity* that is far too
+    lossy: `const Server&` and `Server&&` both became `Server`, so a deleted
+    copy constructor merged into the move constructor and disappeared.
+    """
+    t = (text or "").strip()
+    t = _SIG_NOISE.sub(" ", t)
+    t = re.sub(r"\s+", "", t)
+    return t.replace("*const", "*")
+
+
 def _signature(ent) -> tuple:
     """Identity of an overload: parameter types plus const-ness.
 
     `show()` and `show(int)` differ here; `show(int)` declared and `show(int)`
     defined do not. Parameter *names* are deliberately ignored.
     """
-    return (tuple(_normalize_type(p.get("type") or "") or (p.get("type") or "").strip()
-                  for p in (ent.params or [])),
+    return (tuple(_sig_type(p.get("type") or "") for p in (ent.params or [])),
             bool(getattr(ent, "is_const", False)))
 
 
