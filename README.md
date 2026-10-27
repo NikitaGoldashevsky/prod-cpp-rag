@@ -248,9 +248,18 @@ appears only inside someone else's qualifier does not count — asking about
 one overload only. Pass an id from that list — bare (`Api::show#2`) or prefixed
 (`core::class:src/Api::show#2`) — to look at another.
 
-A class reports `overloaded_members: {name: count}` when several entities share
-a member name, because `members` is a list of *names* and two constructors
-appear there once.
+A class reports `overloaded_members: {name: count}` when a member name has more
+than one **signature**, because `members` is a list of *names* and two
+constructors appear there once. Signatures are compared, not entity counts: a
+declaration and its definition are one member, not an overload. Constructors
+count the same as methods.
+
+When two Class entities answer to one name — a class declared in two headers
+with no `#include` between them, so the include graph cannot join them —
+the payload says so in `same_name_entities` (id, file, line, member count) with
+a hint, because `members` then describes whichever node was returned and may be
+partial. Merging those blindly would risk joining unrelated same-named classes,
+so they are named rather than merged.
 
 ### Name lookup
 

@@ -30,6 +30,7 @@ import time
 from typing import Protocol
 
 from . import core as oc
+from .core import _sig_type
 
 # ---------------------------------------------------------------------------
 # Connection settings
@@ -204,18 +205,60 @@ def lookup_rank(kind: str) -> int:
     return _LOOKUP_RANK.get(kind, 4)
 
 
-def member_overloads(names: list[str], counts: list[int]) -> dict:
-    """Flag class members that are overloaded.
+def member_overloads(members: list[dict]) -> dict:
+    """Flag class members whose name has more than one *signature*.
 
-    `members` is a list of names, so two constructors appear once. A caller
-    reading `members` had no way to know the set was short — this says which
-    names have more than one entity behind them.
+    `members` is a list of names, so two constructors appear there once — this
+    says which names have several entities behind them.
+
+    Two ways this was wrong, both found on a real tree:
+
+    * it counted entities sharing a qname anywhere in the corpus, so a
+      declaration and its definition read as an overload (178 of those across
+      36 classes, every one a false positive);
+    * the Neo4j path counted only `HAS_METHOD`, so constructors were never
+      counted at all (9 classes with overloaded constructors reported none).
+
+    So: group this class's own members by name, and compare *signatures*.
+    A name is overloaded when it has two distinct ones.
     """
-    over = {}
-    for n, c in zip(names, counts):
-        if c > 1:
-            over[n] = c
+    by_name: dict[str, set] = {}
+    for m in members:
+        kind = m.get("kind") or ""
+        sig = (tuple(_sig_type(p.get("type") or "") if isinstance(p, dict)
+                     else _sig_type(getattr(p, "type", "") or "")
+                     for p in (m.get("params") or [])),
+               bool(m.get("is_const", False)))
+        if kind == "Field":
+            sig = ("<field>",)
+        by_name.setdefault(m.get("name") or "", set()).add(sig)
+    over = {n: len(sigs) for n, sigs in by_name.items() if n and len(sigs) > 1}
     return {"overloaded_members": over} if over else {}
+
+
+def duplicate_classes(siblings: list[dict]) -> dict:
+    """Disclose that several Class entities answer to one name.
+
+    Ids are namespaced by directory so same-named classes in different folders
+    stay distinct, and the include graph joins a header to its source. When
+    neither applies — a class declared in two headers with no `#include` between
+    them — two Class nodes exist with *partial* member sets, and `get_entity`
+    returns whichever the lookup prefers. `members` then differs depending on
+    how the class was asked for, with nothing saying so.
+
+    Merging those blindly would risk joining genuinely unrelated same-named
+    classes, so the payload names them instead.
+    """
+    if len(siblings) <= 1:
+        return {}
+    return {
+        "same_name_entities": sorted(siblings,
+                                     key=lambda x: -x.get("members", 0)),
+        "hint": (f"{len(siblings)} class entities share this name; `members` and "
+                 f"`overloaded_members` describe whichever one was returned and "
+                 f"may be partial. Compare `same_name_entities` before deciding "
+                 f"a member is absent."),
+    }
 
 
 def class_location(declared_line: int, members: list[dict],
@@ -383,14 +426,28 @@ class MemoryStore:
                 sib.append({"id": other_id, "params": o2.params,
                             "file": o2.file, "line_start": o2.line_start,
                             "is_definition": o2.is_definition})
-        loc = overload_note(e.qname or "", sib)
+        dup = {}
+        if e.kind in ("Class", "Struct"):
+            same = []
+            for other_id in onto._by_qname.get(e.qname or "", []):
+                o2 = onto.entities.get(other_id)
+                if o2 is None or o2.kind not in ("Class", "Struct"):
+                    continue
+                same.append({"id": other_id, "file": o2.file,
+                             "line_start": o2.line_start,
+                             "is_definition": o2.is_definition,
+                             "members": len(onto._out(other_id, "hasMethod")
+                                            + onto._out(other_id, "hasConstructor")
+                                            + onto._out(other_id, "hasField"))})
+            dup = duplicate_classes(same)
+        loc = {**overload_note(e.qname or "", sib), **dup}
         if e.kind in ("Class", "Struct"):
             kids = [onto.entities[i] for i in
                     onto._out(eid, "hasMethod") + onto._out(eid, "hasConstructor")
                     + onto._out(eid, "hasField") if i in onto.entities]
-            loc = class_location(e.line_start, [
+            loc = {**loc, **class_location(e.line_start, [
                 {"qname": k.qname or k.name, "file": k.file,
-                 "line_start": k.line_start} for k in kids], e.is_definition)
+                 "line_start": k.line_start} for k in kids], e.is_definition)}
         return {
             "id": eid, "kind": e.kind, "name": e.name, "qname": e.qname or e.name,
             "file": e.file, "line_start": e.line_start, "line_end": e.line_end,
@@ -436,13 +493,12 @@ class MemoryStore:
                                onto._out(eid, "hasField")}),
             # `members` de-duplicates by name, so a class with two constructors
             # listed one and nothing said the set was short.
-            **member_overloads(
-                [onto.entities[o].name for o in
-                 onto._out(eid, "hasMethod") + onto._out(eid, "hasConstructor")
-                 + onto._out(eid, "hasField") if o in onto.entities],
-                [len(onto._by_qname.get(onto.entities[o].qname or "", []))
-                 for o in onto._out(eid, "hasMethod") + onto._out(eid, "hasConstructor")
-                 + onto._out(eid, "hasField") if o in onto.entities]),
+            **member_overloads([
+                {"name": onto.entities[o].name, "kind": onto.entities[o].kind,
+                 "params": onto.entities[o].params,
+                 "is_const": onto.entities[o].is_const}
+                for o in (onto._out(eid, "hasMethod") + onto._out(eid, "hasConstructor")
+                          + onto._out(eid, "hasField")) if o in onto.entities]),
             **loc,
             "fact_card": onto._card(e),
             "code": chunk["text"] if chunk else e.code,
@@ -1030,7 +1086,7 @@ class Neo4jStore:
             rel = s.run(
                 "MATCH (a:Entity {dataset:$ds, id:$id})-[r]->(b) "
                 "RETURN type(r) AS t, b.id AS o, b.qname AS oq, b.name AS oname, "
-                "       b.file AS of, b.line_start AS ol, "
+                "       b.file AS of, b.line_start AS ol, b.params_json AS oparams, "
                 "       r.guarded AS guarded, r.line AS line, r.ords AS ords",
                 id=eid, ds=ds).data()
             inbound = s.run(
@@ -1051,8 +1107,18 @@ class Neo4jStore:
                      "line_start": r["ol"]}
                     for r in rel if r["t"] in ("HAS_METHOD", "HAS_CONSTRUCTOR",
                                                "HAS_FIELD")]
-            loc = class_location(node.get("line_start") or 0, kids,
-                                 bool(node.get("is_definition", True)))
+            with self._session() as s2:
+                same = [dict(x, members=x["n"]) for x in s2.run(
+                    "MATCH (e:Entity {dataset:$ds}) "
+                    "WHERE e.qname = $q AND (e:Class OR e:Struct) "
+                    "RETURN e.id AS id, e.file AS file, "
+                    "       e.line_start AS line_start, "
+                    "coalesce(e.is_definition,true) AS is_definition, "
+                    "  size([(e)-[:HAS_METHOD|HAS_CONSTRUCTOR|HAS_FIELD]->() | 1]) AS n",
+                    ds=ds, q=node.get("qname") or "").data()]
+            loc = {**duplicate_classes(same),
+                   **class_location(node.get("line_start") or 0, kids,
+                                    bool(node.get("is_definition", True)))}
         return {
             "id": eid,
             "kind": node.get("kind"),
@@ -1095,15 +1161,13 @@ class Neo4jStore:
                                      if r["t"] == "OVERRIDES"}),
             "members": sorted(set(objs("HAS_METHOD") + objs("HAS_CONSTRUCTOR")
                                   + objs("HAS_FIELD"))),
-            **member_overloads([r["oname"] for r in rel
-                                if r["t"] in ("HAS_METHOD", "HAS_CONSTRUCTOR",
-                                              "HAS_FIELD")],
-                               [len([1 for x in rel
-                                     if x["t"] == "HAS_METHOD"
-                                     and x["oname"] == r["oname"]])
-                                for r in rel if r["t"] in ("HAS_METHOD",
-                                                           "HAS_CONSTRUCTOR",
-                                                           "HAS_FIELD")]),
+            **member_overloads([
+                {"name": r["oname"],
+                 "kind": {"HAS_METHOD": "Method", "HAS_CONSTRUCTOR": "Constructor",
+                          "HAS_FIELD": "Field"}[r["t"]],
+                 "params": json.loads(r["oparams"] or "[]")}
+                for r in rel
+                if r["t"] in ("HAS_METHOD", "HAS_CONSTRUCTOR", "HAS_FIELD")]),
             **loc,
             "fact_card": node.get("fact_card") or "",
             "code": (code["text"] if code else node.get("code") or ""),

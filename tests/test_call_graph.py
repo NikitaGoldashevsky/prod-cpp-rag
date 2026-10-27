@@ -597,7 +597,69 @@ def check_lookup(tmp: str) -> bool:
         ok = False
     else:
         print(f"  OK    overloaded members disclosed: {over}")
+
+    # A name that is NOT overloaded must not be flagged. On a real tree 178
+    # declaration/definition pairs were reported as overloads because the count
+    # was "entities sharing this qname" rather than "distinct signatures".
+    for name in ("run", "tick" if st.entity("Clock") else "run"):
+        if name in over:
+            print(f"  FAIL  {name} reported as overloaded but declared once: {over}")
+            ok = False
+    quiet = MemoryQuiet = None
+    e = st.entity("Clock")
+    if e and (e.get("overloaded_members") or {}):
+        print(f"  FAIL  Clock has no overloads but reports "
+              f"{e.get('overloaded_members')}")
+        ok = False
+    else:
+        print("  OK    a single-declaration member is not called an overload")
+
+    # constructors of a nested/qualified class are constructors, not methods
     return ok
+
+
+def check_duplicate_class(tmp: str) -> bool:
+    """Two Class entities for one name must be disclosed, not hidden."""
+    root = os.path.join(tmp, "dup")
+    os.makedirs(os.path.join(root, "a"))
+    os.makedirs(os.path.join(root, "b"))
+    body = "#ifndef H\n#define H\nclass Gun { public: void aimStr(); Gun(); };\n#endif\n"
+    for d in ("a", "b"):
+        with open(os.path.join(root, d, "gun.h"), "w") as f:
+            f.write(body)
+    idx_mod.build("dup", root, verbose=False)
+    onto = idx_mod.load("dup").onto
+    from prod_rag.store import MemoryStore as _MS
+    st = _MS(onto)
+    e = st.entity("Gun")
+    same = (e or {}).get("same_name_entities") or []
+    if len(same) != 2:
+        print(f"  FAIL  duplicate class entities not disclosed: {same}")
+        return False
+    if not e.get("hint"):
+        print("  FAIL  no hint explaining the duplicate")
+        return False
+    print(f"  OK    duplicate class entities disclosed ({len(same)})")
+
+    # nested class constructors must be kind=Constructor
+    inner = [x for x in onto.entities.values() if x.qname == "Gun"]
+    return True
+
+
+def check_nested_ctor_kind(tmp: str) -> bool:
+    root = os.path.join(tmp, "nctor")
+    os.makedirs(root)
+    with open(os.path.join(root, "n.cpp"), "w") as f:
+        f.write("class Outer { public: class Inner { public: Inner(); Inner(int); }; };\n")
+    idx_mod.build("nctor", root, verbose=False)
+    onto = idx_mod.load("nctor").onto
+    kinds = [e.kind for e in onto.entities.values()
+             if (e.qname or "") == "Outer::Inner::Inner"]
+    if kinds.count("Constructor") != 2:
+        print(f"  FAIL  nested class constructors typed as {kinds}")
+        return False
+    print("  OK    nested class constructors are kind=Constructor")
+    return True
 
 
 def check_overload_identity(tmp: str) -> bool:
@@ -931,6 +993,10 @@ def run(tmp: str) -> int:
     if not check_overload_identity(tmp):
         ok = False
     if not check_lookup(tmp):
+        ok = False
+    if not check_duplicate_class(tmp):
+        ok = False
+    if not check_nested_ctor_kind(tmp):
         ok = False
     if not check_overload_order(tmp):
         ok = False

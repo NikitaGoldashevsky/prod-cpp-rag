@@ -2709,7 +2709,15 @@ def _callee_text(src: bytes, fn_node) -> str:
 
 
 def _callable_kind(name: str, cls_name: str) -> str:
-    if name == cls_name:
+    """Constructor / Destructor / Method.
+
+    The comparison is against the **last segment** of the class name: for a
+    nested class the qname is `Outer::Inner`, and for a qualified declaration it
+    is `Ns::Qual`, so comparing the whole string classified both constructors
+    as plain `Method` — invisible to every `kind == "Constructor"` query.
+    """
+    short = (cls_name or "").rsplit("::", 1)[-1]
+    if name == short or name == cls_name:
         return "Constructor"
     if name.startswith("~"):
         return "Destructor"

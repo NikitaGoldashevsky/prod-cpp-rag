@@ -245,8 +245,12 @@ same-file free functions), never by matching a bare method name. So:
 - `get_entity` accepts both the bare and the namespace-qualified name, and
   ranks `Class`/`Struct` above parameters and aliases — so a bare class name is
   safe to ask for.
-- `overloaded_members` marks class members that have more than one entity
-  behind the name; `members` lists each name once.
+- `overloaded_members` marks class members with more than one signature;
+  `members` lists each name once. A declaration and its definition are one
+  member, so they are not reported as an overload.
+- `same_name_entities` means several Class nodes answer to this name and the
+  `members` you are reading may be partial — check the sibling before saying a
+  member is absent.
 
 If the tools do not appear: run the command by hand in a terminal. It should
 print nothing and wait for stdin. Any output before the handshake breaks the
