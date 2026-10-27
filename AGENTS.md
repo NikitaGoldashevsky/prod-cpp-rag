@@ -233,6 +233,8 @@ same-file free functions), never by matching a bare method name. So:
   across the whole chain, not just the direct subclass. When asked "what breaks
   if I change this method", mention both `callers` and `overridden_by` — an
   empty `callers` on a virtual method does not mean nothing depends on it.
+- `inherited_by` lists the classes that derive from this one; `overrides` /
+  `overridden_by` cover virtual methods across the whole chain.
 - `inherits_unknown` lists bases outside the indexed subtree. If a class has an
   unknown base, a method it appears not to override may really be overriding an
   inherited declaration we cannot see; say so rather than asserting it.

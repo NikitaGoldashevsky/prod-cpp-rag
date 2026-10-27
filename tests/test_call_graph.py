@@ -404,6 +404,116 @@ def _has_use(onto, label: str) -> bool:
     return any(r.p == "callsExternal" and r.o == label for r in onto.relations)
 
 
+SPLIT_HDR = r"""
+#ifndef SPLIT_H
+#define SPLIT_H
+
+class SplitBase
+{
+public:
+    virtual void run();
+    virtual void tick();
+};
+
+class SplitDer : public SplitBase
+{
+public:
+    void run() override;
+    class Inner : public SplitBase
+    {
+    public:
+        void tick() override;
+    };
+};
+
+class SplitMgr
+{
+public:
+    void go();
+};
+
+#endif
+"""
+
+SPLIT_SRC = r"""
+#include "shared/split.h"
+
+void SplitBase::run() {}
+void SplitBase::tick() {}
+void SplitDer::run() { tick(); }
+void SplitDer::Inner::tick() {}
+void SplitMgr::go()
+{
+    SplitDer d;
+    d.run();
+    SplitDer::Inner in;
+    in.tick();
+}
+"""
+
+
+def check_header_source_split(tmp: str) -> bool:
+    """A header in one directory, its source in another, joined by #include.
+
+    Entity ids are namespaced by directory so same-named classes in different
+    folders stay distinct. That split every realistic layout in two: the class
+    existed once from the header (with its base) and once from the .cpp (a
+    body-less stub), so inheritance, overrides and inherited calls were all
+    computed on two halves that each looked incomplete.
+    """
+    root = os.path.join(tmp, "split")
+    os.makedirs(os.path.join(root, "src", "shared"))
+    with open(os.path.join(root, "src", "shared", "split.h"), "w") as f:
+        f.write(SPLIT_HDR)
+    with open(os.path.join(root, "src", "split.cpp"), "w") as f:
+        f.write(SPLIT_SRC)
+    idx_mod.build("split", root, verbose=False)
+    onto = idx_mod.load("split").onto
+    from prod_rag.store import MemoryStore as _MS
+    st = _MS(onto)
+    ok = True
+
+    classes = [e.qname for e in onto.entities.values() if e.kind == "Class"]
+    for name in ("SplitBase", "SplitDer", "SplitDer::Inner", "SplitMgr"):
+        if classes.count(name) != 1:
+            print(f"  FAIL  {name}: {classes.count(name)} entities after the "
+                  f"header/source merge")
+            ok = False
+    if not ok:
+        return False
+    print("  OK    header and source merged across directories")
+
+    der = st.entity("SplitDer")
+    if der.get("inherits_resolved") != ["SplitBase"]:
+        print(f"  FAIL  SplitDer base unresolved: {der.get('inherits_resolved')}")
+        ok = False
+    # inherited unqualified call inside the .cpp half
+    if "SplitBase::tick" not in (st.entity("SplitDer::run") or {}).get("calls", []):
+        print(f"  FAIL  inherited call lost after merge: "
+              f"{(st.entity('SplitDer::run') or {}).get('calls')}")
+        ok = False
+    # qualified-type local, then a call through it
+    if "SplitDer::Inner::tick" not in (st.entity("SplitMgr::go") or {}).get("calls", []):
+        print(f"  FAIL  qualified local type not resolved: "
+              f"{(st.entity('SplitMgr::go') or {}).get('calls')}")
+        ok = False
+    # a nested class must still be a class, and override
+    inner = st.entity("SplitDer::Inner")
+    inner_tick = st.entity("SplitDer::Inner::tick")
+    if not inner_tick or inner_tick.get("overrides") != ["SplitBase::tick"]:
+        print(f"  FAIL  nested class override: {inner_tick and inner_tick.get('overrides')}")
+        ok = False
+    if not inner or not inner.get("line_start"):
+        print("  FAIL  nested class has no declaration line")
+        ok = False
+    # subclasses are visible from the base
+    if st.entity("SplitBase").get("inherited_by") != ["SplitDer", "SplitDer::Inner"]:
+        print(f"  FAIL  inherited_by: {st.entity('SplitBase').get('inherited_by')}")
+        ok = False
+    print("  OK    inherited call, nested override, and inherited_by all resolve")
+    return ok
+
+
 def check_overload_order(tmp: str) -> bool:
     """Same overloads, but the header sorts *before* the .cpp.
 
@@ -705,6 +815,8 @@ def run(tmp: str) -> int:
               "at a member definition")
         ok = False
 
+    if not check_header_source_split(tmp):
+        ok = False
     if not check_overload_order(tmp):
         ok = False
 

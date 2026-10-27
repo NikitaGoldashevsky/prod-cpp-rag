@@ -462,7 +462,31 @@ inherits_unknown:   ['NvStatic']          <- outside the index
 Before this, every inheritance edge was a literal name with no resolved target,
 so the hierarchy walk stopped after one generation and second-generation
 overrides silently vanished. The fact card marks it inline: `inherits
-NvExternal (not in index)`.
+NvExternal (not in index)`, and `inherited_by` (the classes that derive from
+this one) reads the resolved edge, so it is actually populated.
+
+### Header and source in different directories
+
+Entity ids are namespaced by directory so same-named classes in different
+folders stay distinct — but that split every realistic layout in two. A class
+declared in `src/shared_map/X.h` and defined in `src/X.cpp` existed twice: the
+`.cpp` half a body-less stub with no base and no declared methods, the header
+half complete. Inheritance, overrides and inherited calls were then computed on
+two halves that each looked incomplete, and `inherited_by` was empty.
+
+Declarations and definitions are now joined when **one of their files includes
+the other** (directly, in either direction):
+
+```
+src/X.cpp   #include "shared_map/X.h"      ->  one class, base resolved,
+                                                inherited calls resolved
+```
+
+The include check is deliberately direct-only. "Transitively related" would
+merge same-named classes from unrelated modules in any project where everything
+eventually includes everything. Nested classes (`class Form { class Overlay :
+public Painter {...}; }`) are parsed too — they used to be dropped entirely, and
+are the usual shape for a form-local overlay hierarchy.
 
 Two parsing bugs went with it: base classes are now read from the AST, so the
 *template argument* of `public NvStatic<ComplexTimerForm>` is no longer recorded

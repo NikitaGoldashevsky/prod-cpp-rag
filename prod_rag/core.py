@@ -241,6 +241,9 @@ class CppOntology:
         # Without this, a call through a file-static object had an unknown
         # receiver and was reported external although the type is in the tree.
         self._globals: dict[str, str] = {}
+        # file -> the include strings it wrote, used to join a header to the
+        # source that includes it
+        self._include_paths: dict[str, list[str]] = {}
 
     # ---- public -----------------------------------------------------------
     def prescan(self, source_text: str):
@@ -266,6 +269,11 @@ class CppOntology:
         """Single-file entry point (back-compatible)."""
         self.prescan(source_text)
         self._build_one(source_text, filename or self.filename)
+        # Merge FIRST: joining a header to its source changes entity identity,
+        # and call resolution consults parents/bases by id. Resolving before the
+        # merge meant an inherited call inside a .cpp looked up the stub class
+        # (no members, no base) and found nothing.
+        self._merge_across_dirs()
         self._resolve_calls_and_refs()
         self._resolve_bases()
         self._link_overrides()
@@ -293,6 +301,11 @@ class CppOntology:
         trees) when the caller hands the graph to a database that does its own
         lexical search.
         """
+        # Merge FIRST: joining a header to its source changes entity identity,
+        # and call resolution consults parents/bases by id. Resolving before the
+        # merge meant an inherited call inside a .cpp looked up the stub class
+        # (no members, no base) and found nothing.
+        self._merge_across_dirs()
         self._resolve_calls_and_refs()
         self._resolve_bases()
         self._link_overrides()
@@ -459,7 +472,7 @@ class CppOntology:
         if existing.qname and ent.qname and existing.qname != ent.qname:
             return None
         if existing.kind in ("Class", "Struct") and ent.kind in ("Class", "Struct"):
-            if existing.name != ent.name:
+            if (existing.qname or existing.name) != (ent.qname or ent.name):
                 return None
             # keep the one with a body; a forward declaration has none
             if ent.is_definition and not existing.is_definition:
@@ -586,6 +599,7 @@ class CppOntology:
             if hid not in self.entities:
                 self._add(Entity(id=hid, kind="Header", name=path))
             self._rel(self._cur_file_id, "includes", hid)
+            self._include_paths.setdefault(self._cur_rel, []).append(path)
 
     def _handle_alias(self, node):
         # using json = nlohmann::json;
@@ -634,13 +648,24 @@ class CppOntology:
                 if name:
                     self._rel(cls_id, "inheritsFrom", name, literal=True)
 
-    def _handle_class(self, node):
+    def _handle_class(self, node, scope: str = "", scope_id: str | None = None):
+        """A class or struct. `scope` is the enclosing class for a nested one.
+
+        Nested classes (`class Form { class Overlay : public Painter {...}; }`)
+        used to be dropped entirely: `_class_members` had no case for a
+        `class_specifier` child, so the declaration vanished and the class only
+        appeared later as a body-less stub created by its out-of-line method
+        definitions — with no base, no line number and no methods declared in
+        the header.
+        """
         name_node = _child_by_field(node, "name")
         name = _text(self.src_bytes, name_node) if name_node else "<anonymous>"
-        cid = self._qid("class", name)
         kind = "Class" if node.type == "class_specifier" else "Struct"
+        qname = f"{scope}::{name}" if scope else name
+        cid = self._qid("class", qname)
         body_node = _child_by_field(node, "body")
-        ent = Entity(id=cid, kind=kind, name=name, qname=name,
+        ent = Entity(id=cid, kind=kind, name=name, qname=qname,
+                     parent=scope_id,
                      file=self._cur_rel,
                      line_start=node.start_point[0] + 1, line_end=node.end_point[0] + 1,
                      # `class Foo;` is a forward declaration, not the class.
@@ -650,13 +675,15 @@ class CppOntology:
                      code=_text(self.src_bytes, node))
         self._add(ent)
         self._rel(self._cur_file_id, "declares", cid)
+        if scope_id:
+            self._rel(scope_id, "hasClass", cid)
         self._class_header_relations(node, cid)
 
         body = body_node
         if not body:
             return
         current_access = "private" if kind == "Class" else "public"
-        self._class_members(body.children, cid, name, current_access)
+        self._class_members(body.children, cid, qname, current_access)
 
     # `public slots:` / `signals:` / `Q_SLOTS:` are access labels with a macro
     # in them; tree-sitter sees a field_declaration that swallows the following
@@ -699,6 +726,13 @@ class CppOntology:
                 self._class_members(inner, cid, cls_name, access)
                 continue
             text = _text(self.src_bytes, child)
+            if child.type in ("field_declaration", "declaration", "template_declaration"):
+                nested = [x for x in _walk(child)
+                          if x.type in ("class_specifier", "struct_specifier")]
+                if nested and nested[0].parent is not None and \
+                        nested[0].parent is not child:
+                    self._handle_class(nested[0], scope=cls_name, scope_id=cid)
+                    continue
             if child.type in ("field_declaration", "declaration"):
                 if self._ACCESS_LABEL.match(text):
                     m = re.match(r"(public|private|protected)", text)
@@ -718,6 +752,8 @@ class CppOntology:
                     self._handle_method_declaration(child, cid, cls_name, access)
                 else:
                     self._handle_field(child, cid, cls_name, access)
+            elif child.type in ("class_specifier", "struct_specifier"):
+                self._handle_class(child, scope=cls_name, scope_id=cid)
             elif child.type == "function_definition":
                 self._handle_function(child, owner_class=cls_name, owner_id=cid,
                                       access=access)
@@ -769,9 +805,19 @@ class CppOntology:
     def _resolve_class(self, name: str):
         """Find the class/struct entity for `name`, preferring one declared in
         the same directory (so a `.cpp` attaches to its header's class when two
-        same-named classes exist in different folders). None if ambiguous."""
-        ids = [i for i, e in self.entities.items()
-               if e.kind in ("Class", "Struct") and e.name == name]
+        same-named classes exist in different folders). None if ambiguous.
+
+        `name` may be qualified (`Outer::Inner`), which is how a nested class
+        is written at its out-of-line definitions.
+        """
+        by_q = [i for i, e in self.entities.items()
+                if e.kind in ("Class", "Struct")
+                and (e.qname or e.name) == name]
+        if by_q:
+            ids = by_q
+        else:
+            ids = [i for i, e in self.entities.items()
+                   if e.kind in ("Class", "Struct") and e.name == name]
         if not ids:
             return None
         if len(ids) == 1:
@@ -804,8 +850,13 @@ class CppOntology:
             else:
                 cid = self._qid("class", scope)
                 if cid not in self.entities:
-                    self._add(Entity(id=cid, kind="Class", name=scope, qname=scope,
-                                     file=self._cur_rel))
+                    # A stub for a class we only saw defined out of line. The
+                    # `name` is the last segment so it matches the real
+                    # declaration and merges with it; `is_definition=False`
+                    # because there is no body here.
+                    self._add(Entity(id=cid, kind="Class",
+                                     name=scope.rsplit("::", 1)[-1], qname=scope,
+                                     file=self._cur_rel, is_definition=False))
                     self._rel(self._cur_file_id, "declares", cid)
                 parent_id = cid
         ret = _declarator_return_type(self.src_bytes, node, fd)
@@ -1002,8 +1053,13 @@ class CppOntology:
         for eid, e in self.entities.items():
             if e.kind in ("Class", "Struct"):
                 classes_by_name.setdefault(e.name, []).append(eid)
+        qclasses: dict[str, list[str]] = {}
+        for name, ids in classes_by_name.items():
+            for i in ids:
+                qclasses.setdefault(self.entities[i].qname or name, []).append(i)
         ctx = {"by_suffix": by_suffix, "members": members, "bases": bases,
-               "classes": classes_by_name, "fields": self._field_types()}
+               "classes": classes_by_name, "qclasses": qclasses,
+               "fields": self._field_types()}
 
         unknown_base_ids = {cid for cid, bs in bases.items()
                             if any(b not in classes_by_name for b in bs)}
@@ -1213,6 +1269,112 @@ class CppOntology:
         return None
 
     # ---- resolution helpers ----------------------------------------------
+    def _merge_across_dirs(self) -> int:
+        """Join a declaration and its definition when they live in different
+        directories but one file includes the other.
+
+        Entity ids are namespaced by directory so same-named classes in
+        different folders stay distinct — correct, but it split every pair of
+        `src/shared_map/X.h` and `src/X.cpp`, which is how most real projects
+        are laid out. The class then existed twice: the `.cpp` half a body-less
+        stub with no base and no declared methods, the header half complete.
+        Inheritance and overrides were computed on both halves and each looked
+        incomplete.
+
+        Merging is gated on the include graph: two entities with the same qname
+        are joined only when one of their files includes the other (directly or
+        transitively). Same-named classes in unrelated directories stay apart.
+        """
+        if not self._include_paths:
+            return 0
+        files = set(self.files)
+        by_base: dict[str, list[str]] = {}
+        for f in files:
+            by_base.setdefault(f.rsplit("/", 1)[-1], []).append(f)
+
+        def resolve(inc: str) -> str | None:
+            if inc in files:
+                return inc
+            cands = by_base.get(inc.rsplit("/", 1)[-1], [])
+            if len(cands) == 1:
+                return cands[0]
+            # prefer the candidate whose path is a suffix of the written include
+            hits = [c for c in cands if c.endswith("/" + inc)]
+            return hits[0] if len(hits) == 1 else None
+
+        # Direct include only, in either direction. Transitively "related" is
+        # too weak: in a project where everything eventually includes
+        # everything, it would merge same-named classes from unrelated modules.
+        # A source including its own header is the relation that actually
+        # means "same entity".
+        pairs: set[tuple[str, str]] = set()
+        for f, incs in self._include_paths.items():
+            for inc in incs:
+                t = resolve(inc)
+                if t and t != f:
+                    pairs.add((f, t))
+                    pairs.add((t, f))
+
+        def connected(fa: str, fb: str) -> bool:
+            return fa == fb or (fa, fb) in pairs
+
+        groups: dict[str, list[str]] = {}
+        joinable = ("Class", "Struct", "Method", "Function", "Constructor",
+                    "Destructor", "Field", "TypeAlias")
+        for eid, e in self.entities.items():
+            if e.kind in joinable and e.qname:
+                groups.setdefault((e.kind, e.qname), []).append(eid)
+
+        remap: dict[str, str] = {}
+        for (kind, qname), ids in groups.items():
+            if len(ids) < 2:
+                continue
+            keep = self._best_of(ids)
+            kfile = self.entities[keep].file
+            for other in ids:
+                if other == keep:
+                    continue
+                if connected(kfile, self.entities[other].file):
+                    remap[other] = keep
+        if not remap:
+            return 0
+
+        # rewrite relations, then drop the absorbed entities
+        out = []
+        for r in self.relations:
+            s_id = remap.get(r.s, r.s)
+            o_id = r.o if r.literal else remap.get(r.o, r.o)
+            if s_id == o_id and r.p != "calls":
+                continue                      # a self-edge a merge created
+            out.append(Relation(s_id, r.p, o_id, r.literal, r.guarded))
+        self.relations = out
+        for old, new in remap.items():
+            ent = self.entities.pop(old, None)
+            if ent is None:
+                continue
+            if ent.qname:
+                self._by_qname[ent.qname] = [x for x in
+                                             self._by_qname.get(ent.qname, [])
+                                             if x != old]
+        for eid in self.entities:
+            e = self.entities[eid]
+            if e.parent in remap:
+                e.parent = remap[e.parent]
+        self._out_index = None
+        self._guard_index = None
+        self._adj = None
+        self.index_names()
+        return len(remap)
+
+    def _best_of(self, ids: list[str]) -> str:
+        """Which of several same-qname entities to keep: definition first, then
+        one with a body, then the one with the earliest source position."""
+        def key(i):
+            e = self.entities[i]
+            return (not e.is_definition, not bool(e.code),
+                    e.line_start or 10 ** 6, e.file)
+        return sorted(ids, key=key)[0]
+
     def _resolve_bases(self) -> None:
         """Link each `inheritsFrom` to the class entity when it is in the tree.
 
@@ -1350,11 +1512,14 @@ class CppOntology:
             elif r.p == "inheritsFrom":
                 bases.setdefault(r.s, []).append(r.o)
         classes: dict[str, list[str]] = {}
+        qclasses: dict[str, list[str]] = {}
         for eid, e in self.entities.items():
             if e.kind in ("Class", "Struct"):
                 classes.setdefault(e.name, []).append(eid)
+                qclasses.setdefault(e.qname or e.name, []).append(eid)
         return {"by_suffix": by_suffix, "members": members, "bases": bases,
-                "classes": classes, "fields": self._field_types()}
+                "classes": classes, "qclasses": qclasses,
+                "fields": self._field_types()}
 
     def _class_for(self, name: str, near_file: str | None, ctx: dict):
         """The class entity for `name`, preferring one from the same directory."""
@@ -1433,6 +1598,15 @@ class CppOntology:
         expr = expr.rstrip(")").strip()          # `foo()` used as a receiver
         if not expr:
             return None
+        # A qualified type (`Der::Inner`) is not a chain — but the chain split
+        # below only takes the first identifier, so `Der::Inner in; in.tick()`
+        # resolved to `Der` and looked for `tick` on the wrong class.
+        bare = expr.strip()
+        if "::" in bare and "(" not in bare:
+            hit = self._class_of_qname(bare, ctx)
+            if hit:
+                return hit
+
         steps = [s for s in (x.strip() for x in self._CHAIN.split(expr)) if s]
         if not steps or len(steps) > 4:
             return None
@@ -1464,10 +1638,20 @@ class CppOntology:
                 pass                              # `arr[i]` used as a value
         return cur
 
+    def _class_of_qname(self, text: str, ctx: dict):
+        """Class entity whose qname (or name) is exactly `text`."""
+        t = text.strip().lstrip("*&").strip()
+        hits = ctx["qclasses"].get(t) or []
+        return hits[0] if len(hits) == 1 else None
+
     def _class_of_type(self, type_text: str | None, near: str | None, ctx: dict):
         """Class entity for a declared type text, container element as fallback."""
         if not type_text:
             return None
+        # keep the qualifier when it is what disambiguates: `Der::Inner`
+        q = self._class_of_qname(type_text, ctx)
+        if q:
+            return q
         names = ctx["classes"]
         t = _normalize_type(type_text)
         if t and t in names:

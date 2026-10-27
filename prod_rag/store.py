@@ -378,8 +378,12 @@ class MemoryStore:
                  if b not in {onto.entities[x].name for x in
                               onto._out(eid, "inheritsClass")
                               if x in onto.entities}}),
-            "inherited_by": [lab(r.s) for r in onto.relations
-                             if r.o == eid and r.p == "inheritsFrom"],
+            # `inheritsFrom` points at a *name*, which for an out-of-tree base
+            # lands on nothing; the resolved edge is what a Class can be the
+            # target of. Filtering on the literal predicate reported "nobody
+            # derives from this" for every class in the graph.
+            "inherited_by": sorted({lab(r.s) for r in onto.relations
+                                    if r.p == "inheritsClass" and r.o == eid}),
             # Virtual dispatch: a call through a base pointer reaches these at
             # runtime even though the `calls` edge points at the declaration.
             "overrides": [lab(o) for o in onto._out(eid, "overrides")],
@@ -1008,8 +1012,8 @@ class Neo4jStore:
                  if r["t"] == "INHERITS_FROM"}
                 - {label(r["oq"], r["oname"]) for r in rel
                    if r["t"] == "INHERITS_CLASS"}),
-            "inherited_by": sorted({r["sq"] or r["s"] for r in inbound
-                                    if r["t"] == "INHERITS_FROM"}),
+            "inherited_by": sorted({label(r["sq"], r["sname"]) for r in inbound
+                                    if r["t"] == "INHERITS_CLASS"}),
             "overrides": sorted(set(objs("OVERRIDES"))),
             "overridden_by": sorted({label(r["sq"], r["sname"]) for r in inbound
                                      if r["t"] == "OVERRIDES"}),
