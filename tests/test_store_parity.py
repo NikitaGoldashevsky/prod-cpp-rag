@@ -149,6 +149,16 @@ def main(argv) -> int:
         print(f"  OK    search returns facts + chunks on {len(QUESTIONS)} questions; "
               "symbol queries surface the symbol")
 
+        # ---- class location parity ---------------------------------------
+        for q in ("Server", "TcpClient", "CommandHandler"):
+            a, b = mem.entity(q), neo.entity(q)
+            if not a or not b:
+                continue
+            for key in ("declared_in_index", "first_member"):
+                if a.get(key) != b.get(key):
+                    fail(f"{q}.{key}: memory={a.get(key)} neo4j={b.get(key)}")
+        print("  OK    class location parity (declared_in_index, first_member)")
+
         # ---- dataset isolation -------------------------------------------
         # Two submodules in one graph must not bleed into each other, and a
         # query for a dataset that was never pushed must refuse, not guess.

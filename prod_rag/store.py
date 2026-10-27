@@ -118,6 +118,25 @@ def match_rank(qname: str, name: str, pattern: str) -> tuple[int, str]:
     return best or (3, "substring")
 
 
+def class_location(declared_line: int, members: list[dict]) -> dict:
+    """Honest location for a class/struct.
+
+    A class seen only through `Class::method` definitions has no declaration in
+    the index (the header lives outside the indexed subtree). Reporting
+    `line_start: 0` silently is what makes a tool look broken; instead say the
+    declaration is absent and point at the first member that *is* in the tree.
+    """
+    if declared_line:
+        return {"declared_in_index": True, "first_member": None}
+    tops = sorted((m for m in members if m.get("line_start")),
+                  key=lambda m: (m.get("file") or "", m.get("line_start") or 0))
+    return {"declared_in_index": False,
+            "first_member": ({"qname": tops[0].get("qname"),
+                              "file": tops[0].get("file"),
+                              "line_start": tops[0].get("line_start")}
+                             if tops else None)}
+
+
 def rank_symbol_hits(hits: list[dict], pattern: str, limit: int) -> list[dict]:
     """Sort hits word-boundary-first and annotate each with its `match` kind."""
     out = []
@@ -220,6 +239,14 @@ class MemoryStore:
         e = onto.entities[eid]
         lab = lambda x: (onto.entities[x].qname if x in onto.entities else x)
         chunk = next((c for c in onto.chunks if c["id"] == eid), None)
+        loc = {}
+        if e.kind in ("Class", "Struct"):
+            kids = [onto.entities[i] for i in
+                    onto._out(eid, "hasMethod") + onto._out(eid, "hasConstructor")
+                    + onto._out(eid, "hasField") if i in onto.entities]
+            loc = class_location(e.line_start, [
+                {"qname": k.qname or k.name, "file": k.file,
+                 "line_start": k.line_start} for k in kids])
         return {
             "id": eid, "kind": e.kind, "name": e.name, "qname": e.qname or e.name,
             "file": e.file, "line_start": e.line_start, "line_end": e.line_end,
@@ -242,6 +269,7 @@ class MemoryStore:
                                onto._out(eid, "hasMethod") +
                                onto._out(eid, "hasConstructor") +
                                onto._out(eid, "hasField")}),
+            **loc,
             "fact_card": onto._card(e),
             "code": chunk["text"] if chunk else e.code,
         }
@@ -715,6 +743,7 @@ class Neo4jStore:
             rel = s.run(
                 "MATCH (a:Entity {dataset:$ds, id:$id})-[r]->(b) "
                 "RETURN type(r) AS t, b.id AS o, b.qname AS oq, b.name AS oname, "
+                "       b.file AS of, b.line_start AS ol, "
                 "       r.guarded AS guarded, r.line AS line, r.ords AS ords",
                 id=eid, ds=ds).data()
             inbound = s.run(
@@ -726,6 +755,13 @@ class Neo4jStore:
         label = lambda q, nm: q or nm
         def objs(t):
             return [label(r["oq"], r["oname"]) for r in rel if r["t"] == t]
+        loc = {}
+        if node.get("kind") in ("Class", "Struct"):
+            kids = [{"qname": label(r["oq"], r["oname"]), "file": r["of"],
+                     "line_start": r["ol"]}
+                    for r in rel if r["t"] in ("HAS_METHOD", "HAS_CONSTRUCTOR",
+                                               "HAS_FIELD")]
+            loc = class_location(node.get("line_start") or 0, kids)
         return {
             "id": eid,
             "kind": node.get("kind"),
@@ -752,6 +788,7 @@ class Neo4jStore:
             "inherited_by": sorted({r["s"] for r in inbound if r["t"] == "INHERITS_FROM"}),
             "members": sorted(set(objs("HAS_METHOD") + objs("HAS_CONSTRUCTOR")
                                   + objs("HAS_FIELD"))),
+            **loc,
             "fact_card": node.get("fact_card") or "",
             "code": (code["text"] if code else node.get("code") or ""),
         }

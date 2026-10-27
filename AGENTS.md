@@ -181,6 +181,22 @@ Notes:
 3. `get_entity("SomeKnownName")` → returns `"found": true` with `callers`,
    `throw_sites` and `fact_card`.
 
+### Reading `calls` / `callers` honestly
+
+The call graph is resolved by C++ scope (own class, bases, typed receivers,
+same-file free functions), never by matching a bare method name. So:
+
+- `calls` is trustworthy for member calls, inherited calls, calls through
+  parameters/locals/fields of known type, and `Type(args)` constructors.
+- Anything it could not resolve appears in `uses` (the `CALLS_EXTERNAL` set) with
+  its receiver attached, e.g. `res.append`, `ip_.c_str`, `::connect`. That means
+  "outside the indexed tree, or the receiver type is unknown" — **not** "no
+  call". Never report a `uses` entry as a call to a project function.
+- If a call you can see in the source is missing from both `calls` and `uses`,
+  that is a bug worth reporting, not something to paper over.
+- A class with `declared_in_index: false` has its header outside the indexed
+  subtree; use `first_member` to point at real code instead of `line_start: 0`.
+
 If the tools do not appear: run the command by hand in a terminal. It should
 print nothing and wait for stdin. Any output before the handshake breaks the
 protocol — capture the stderr and report it.

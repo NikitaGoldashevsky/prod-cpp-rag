@@ -181,8 +181,13 @@ class CppOntology:
         self._known_namespaces: set[str] = set()   # prescan: namespace names
         self._out_index: dict | None = None
         self._adj: tuple | None = None
-        self._raw_calls: list[tuple[str, str]] = []
+        # (caller_id, callee_text, n_args). The callee keeps its receiver
+        # (`res.append`, not `append`) — dropping it is what let a QString
+        # method call collide with an unrelated `TextForm::append`.
+        self._raw_calls: list[tuple[str, str, int]] = []
         self._raw_refs: list[tuple[str, str]] = []
+        # caller_id -> {local variable name: declared type}
+        self._locals: dict[str, dict[str, str]] = {}
 
     # ---- public -----------------------------------------------------------
     def prescan(self, source_text: str):
@@ -645,15 +650,33 @@ class CppOntology:
 
     # ---- calls / throws ---------------------------------------------------
     def _extract_calls(self, node, caller_id):
+        # Local declarations give the receiver of `res.append(...)` a type.
+        # Without this the receiver is just a name and any same-named method
+        # anywhere in the corpus is a candidate.
+        locals_ = self._locals.setdefault(caller_id, {})
         for desc in _walk(node):
-            if desc.type != "call_expression":
-                continue
-            fn = _child_by_field(desc, "function")
-            if fn is None:
-                continue
-            callee = _callee_text(self.src_bytes, fn)
-            if callee:
-                self._raw_calls.append((caller_id, callee))
+            if desc.type == "declaration":
+                tnode = _child_by_field(desc, "type")
+                tname = _normalize_type(_text(self.src_bytes, tnode)) if tnode else ""
+                if tname:
+                    try:
+                        decls = desc.children_by_field_name("declarator")
+                    except AttributeError:              # pragma: no cover
+                        decls = []
+                    for d in decls:
+                        nm = _field_name(self.src_bytes, d)
+                        if nm:
+                            locals_.setdefault(nm, tname)
+            elif desc.type == "call_expression":
+                fn = _child_by_field(desc, "function")
+                if fn is None:
+                    continue
+                callee = _callee_text(self.src_bytes, fn)
+                if not callee:
+                    continue
+                args = _child_by_field(desc, "arguments")
+                nargs = len(args.named_children) if args is not None else -1
+                self._raw_calls.append((caller_id, callee, nargs))
 
     def _extract_refs(self, node, caller_id):
         """Capture `&Class::method` / qualified symbol references that are not
@@ -673,10 +696,29 @@ class CppOntology:
             if idx != -1:
                 by_suffix.setdefault(qname[idx + 2:], []).extend(idlist)
 
-        seen_calls: set[tuple[str, str]] = set()
+        # class -> member name -> [ids]; class -> base names. Resolution walks
+        # scope first (own class, then bases), which is what C++ does, instead
+        # of guessing from every same-named symbol in the corpus.
+        members: dict[str, dict[str, list[str]]] = {}
+        bases: dict[str, list[str]] = {}
+        for r in self.relations:
+            if r.p in ("hasMethod", "hasConstructor", "hasField"):
+                e = self.entities.get(r.o)
+                if e is not None:
+                    members.setdefault(r.s, {}).setdefault(e.name, []).append(r.o)
+            elif r.p == "inheritsFrom":
+                bases.setdefault(r.s, []).append(r.o)
+        classes_by_name: dict[str, list[str]] = {}
+        for eid, e in self.entities.items():
+            if e.kind in ("Class", "Struct"):
+                classes_by_name.setdefault(e.name, []).append(eid)
+        ctx = {"by_suffix": by_suffix, "members": members, "bases": bases,
+               "classes": classes_by_name, "fields": self._field_types()}
 
-        for caller, callee in self._raw_calls:
-            local = self._resolve_call(callee, self._caller_file(caller), by_suffix)
+        seen_calls: set[tuple[str, str]] = set()
+        for caller, callee, nargs in self._raw_calls:
+            local = self._resolve_call(callee, self.entities.get(caller), ctx,
+                                       nargs=nargs)
             if local:
                 self._rel(caller, "calls", local)
                 seen_calls.add((caller, local))
@@ -684,29 +726,240 @@ class CppOntology:
                 self._rel(caller, "callsExternal", callee, literal=True)
 
         for caller, ref in self._raw_refs:
-            local = self._resolve_call(ref, self._caller_file(caller), by_suffix)
+            local = self._resolve_call(ref, self.entities.get(caller), ctx)
             # a `references` edge is redundant when the same pair already has a
             # `calls` edge; a set makes that check O(1) instead of a scan.
             if local and (caller, local) not in seen_calls:
                 self._rel(caller, "references", local)
 
+    # ---- call resolution --------------------------------------------------
+    def _resolve_call(self, callee: str, caller=None, ctx: dict | None = None,
+                      nargs: int = -1):
+        """Resolve a callee the way C++ scoping does, innermost scope first.
+
+        Order: own class member -> base-class member -> same-file function ->
+        same-directory function -> a name that is unique in the whole corpus.
+        A receiver we cannot type (`res.append` where `res` is unknown) is left
+        unresolved on purpose: guessing from the bare method name is what made
+        `res.append(...)` look like a call to `TextForm::append`.
+        """
+        caller_file = caller.file if caller is not None else None
+        if ctx is None:
+            ctx = self._resolution_context()
+        members, bases = ctx["members"], ctx["bases"]
+
+        callee = (callee or "").strip()
+        if not callee:
+            return None
+        # A leading `::` is an explicit request for global scope:
+        # `::connect(sockfd, ...)` is the libc call, not `TcpClient::connect`
+        # (a real false self-edge on cct-app).
+        global_scope = callee.startswith("::")
+        if global_scope:
+            callee = callee[2:]
+        callee = _strip_template_args(callee)
+        if not callee:
+            return None
+
+        # `this->x()` / `this.x()` -> the caller's own class
+        for sep in ("->", "."):
+            if callee.startswith("this" + sep):
+                return self._member_of(caller.parent if caller else None,
+                                       callee[len("this" + sep):],
+                                       members, bases, nargs, ctx)
+
+        # `obj.method()` / `ptr->method()`: resolve only when obj's type is known
+        if "->" in callee or "." in callee:
+            sep = "->" if "->" in callee else "."
+            recv, _, name = callee.rpartition(sep)
+            recv, name = recv.strip(), name.strip()
+            if recv and name:
+                cls = self._type_class(recv, caller, ctx)
+                if cls:
+                    hit = self._member_of(cls, name, members, bases, nargs, ctx)
+                    if hit:
+                        return hit
+                return None          # unknown receiver: do not guess
+            return None
+
+        # `Class::method` / `ns::fn` — qualified: exact match first
+        if "::" in callee:
+            hit = self._pick_entity(self._by_qname.get(callee, []), caller_file)
+            if hit:
+                return hit
+            owner, _, name = callee.rpartition("::")
+            cls = self._class_for(owner, caller_file, ctx)
+            if cls:
+                hit = self._member_of(cls, name, members, bases, nargs, ctx)
+                if hit:
+                    return hit
+            # namespace-qualified free function defined without its namespace
+            return self._pick_entity(self._by_qname.get(name, []), caller_file)
+
+        # bare name: own class scope first, then its bases — unless the call
+        # asked for global scope explicitly
+        if not global_scope:
+            hit = self._member_of(caller.parent if caller else None, callee,
+                                  members, bases, nargs, ctx)
+            if hit:
+                return hit
+
+        # `Type(args)` is a constructor call. Without this, `return DeviceState(...)`
+        # loses its edge entirely — the class name is neither a member nor a
+        # free function.
+        if callee in ctx["classes"]:
+            cls = self._class_for(callee, caller_file, ctx)
+            if cls:
+                ctor = self._member_of(cls, callee.split("::")[-1], members,
+                                       bases, nargs, ctx)
+                return ctor or cls
+
+        # free functions: same file, then same directory
+        cands = [i for i in self._by_qname.get(callee, [])
+                 if i in self.entities and self.entities[i].kind == "Function"]
+        hit = self._pick_entity(cands, caller_file)
+        if hit:
+            return hit
+        # Otherwise only a *free function* that is unambiguous corpus-wide. A
+        # method of an unrelated class is never a valid target for a bare call:
+        # `render()` inside SingleTimer is not `Widget::render`, it is either a
+        # member (handled above) or a free function. Guessing here produced
+        # exactly that false edge on a real 667-file submodule.
+        uniq = {i for i in ctx["by_suffix"].get(callee, [])
+                if i in self.entities and self.entities[i].kind == "Function"}
+        if len(uniq) == 1:
+            return next(iter(uniq))
+        return None
+
+    # ---- resolution helpers ----------------------------------------------
+    def _resolution_context(self) -> dict:
+        """Indexes `_resolve_call` needs: members, bases, classes, suffixes."""
+        by_suffix: dict[str, list[str]] = {}
+        for qname, idlist in self._by_qname.items():
+            i = qname.rfind("::")
+            if i != -1:
+                by_suffix.setdefault(qname[i + 2:], []).extend(idlist)
+        members: dict[str, dict[str, list[str]]] = {}
+        bases: dict[str, list[str]] = {}
+        for r in self.relations:
+            if r.p in ("hasMethod", "hasConstructor", "hasField"):
+                e = self.entities.get(r.o)
+                if e is not None:
+                    members.setdefault(r.s, {}).setdefault(e.name, []).append(r.o)
+            elif r.p == "inheritsFrom":
+                bases.setdefault(r.s, []).append(r.o)
+        classes: dict[str, list[str]] = {}
+        for eid, e in self.entities.items():
+            if e.kind in ("Class", "Struct"):
+                classes.setdefault(e.name, []).append(eid)
+        return {"by_suffix": by_suffix, "members": members, "bases": bases,
+                "classes": classes, "fields": self._field_types()}
+
+    def _class_for(self, name: str, near_file: str | None, ctx: dict):
+        """The class entity for `name`, preferring one from the same directory."""
+        ids = [i for i in ctx["classes"].get(name, []) if i in self.entities]
+        if not ids:
+            return None
+        if len(ids) == 1:
+            return ids[0]
+        if near_file:
+            same_file = [i for i in ids if self.entities[i].file == near_file]
+            if len(same_file) == 1:
+                return same_file[0]
+            cdir = os.path.dirname(near_file)
+            same_dir = [i for i in ids
+                        if os.path.dirname(self.entities[i].file or "") == cdir]
+            if len(same_dir) == 1:
+                return same_dir[0]
+        return None
+
+    def _member_of(self, class_id, name: str, members: dict, bases: dict,
+                   nargs: int = -1, ctx: dict | None = None, depth: int = 0):
+        """Look `name` up in a class and its bases (depth-limited)."""
+        if not class_id or depth > 3 or class_id not in self.entities:
+            return None
+        ids = members.get(class_id, {}).get(name)
+        if ids:
+            return self._pick_overload(ids, nargs)
+        near = self.entities[class_id].file
+        for base_name in bases.get(class_id, []):
+            base_id = self._class_for(base_name, near, ctx) if ctx else None
+            if base_id and base_id != class_id:
+                hit = self._member_of(base_id, name, members, bases, nargs,
+                                      ctx, depth + 1)
+                if hit:
+                    return hit
+        return None
+
+    def _pick_overload(self, ids: list[str], nargs: int):
+        """Choose between overloads by argument count, when that is decisive."""
+        ids = [i for i in dict.fromkeys(ids) if i in self.entities]
+        if not ids:
+            return None
+        if len(ids) == 1 or nargs < 0:
+            return ids[0]
+        exact = [i for i in ids if len(self.entities[i].params) == nargs]
+        if exact:
+            return exact[0]
+        fits = [i for i in ids if len(self.entities[i].params) >= nargs]
+        return fits[0] if fits else ids[0]
+
+    def _type_class(self, expr: str, caller, ctx: dict):
+        """The class a receiver expression has, if we can know it honestly."""
+        expr = expr.strip()
+        if expr in ("this", ""):
+            return caller.parent if caller else None
+        if expr[0] in "*&":
+            expr = expr[1:].strip()
+        cls_names = ctx["classes"]
+        near = caller.file if caller else None
+        if expr in cls_names:                # `Foo.bar()` / `Foo->bar()`
+            return self._class_for(expr, near, ctx)
+        tname = self._declared_type(expr, caller, ctx)
+        if tname and tname in cls_names:
+            return self._class_for(tname, near, ctx)
+        return None
+
+    def _declared_type(self, var: str, caller, ctx: dict | None = None):
+        """Declared type of a parameter, a local, or a field of the caller."""
+        if caller is None:
+            return None
+        for p in caller.params or []:
+            if p.get("name") == var:
+                return _normalize_type(p.get("type") or "")
+        local = self._locals.get(caller.id, {}).get(var)
+        if local:
+            return local
+        ctx = ctx or self._resolution_context()
+        fields = ctx["fields"]
+        cls = caller.parent
+        for _ in range(4):                    # walk the base chain
+            if not cls or cls not in self.entities:
+                return None
+            t = fields.get(cls, {}).get(var)
+            if t:
+                return t
+            nb = ctx["bases"].get(cls, [])
+            if not nb:
+                return None
+            cls = self._class_for(nb[0], caller.file, ctx)
+        return None
+
+    def _field_types(self) -> dict[str, dict[str, str]]:
+        """class id -> {field name: normalized type}. Built once per build."""
+        out: dict[str, dict[str, str]] = {}
+        for r in self.relations:
+            if r.p != "hasField":
+                continue
+            f = self.entities.get(r.o)
+            if f is None:
+                continue
+            out.setdefault(r.s, {})[f.name] = _normalize_type(f.type_ref or "")
+        return out
+
     def _caller_file(self, entity_id: str):
         e = self.entities.get(entity_id)
         return e.file if e else None
-
-    def _resolve_call(self, callee: str, caller_file: str | None = None,
-                      by_suffix: dict[str, list[str]] | None = None):
-        # exact qualified / bare-name match, then "method of some class"
-        hit = self._pick_entity(self._by_qname.get(callee, []), caller_file)
-        if hit:
-            return hit
-        if by_suffix is None:            # direct callers (tests) still work
-            by_suffix = {}
-            for q, idlist in self._by_qname.items():
-                idx = q.rfind("::")
-                if idx != -1:
-                    by_suffix.setdefault(q[idx + 2:], []).extend(idlist)
-        return self._pick_entity(by_suffix.get(callee, []), caller_file)
 
     def _pick_entity(self, ids, caller_file):
         """Disambiguate a set of same-named entities. Prefers the one defined in
@@ -1338,16 +1591,75 @@ def _parse_params(src: bytes, fd) -> list[dict]:
     return params
 
 
+def _strip_template_args(text: str) -> str:
+    """`QVector<QString>::size` -> `QVector::size` (depth-aware).
+
+    Operator names keep their punctuation: `operator<<` must not become
+    `operator`, or every stream operator would collapse into one symbol.
+    """
+    if "operator" in text:
+        return text
+    out, depth = [], 0
+    for ch in text:
+        if ch == "<":
+            depth += 1
+            continue
+        if ch == ">":
+            depth = max(0, depth - 1)
+            continue
+        if depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
+_BUILTIN_TYPES = {
+    "void", "bool", "char", "short", "int", "long", "float", "double",
+    "size_t", "ssize_t", "wchar_t", "char8_t", "char16_t", "char32_t", "auto",
+    "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int8_t", "int16_t",
+    "int32_t", "int64_t", "qint8", "qint16", "qint32", "qint64",
+    "quint8", "quint16", "quint32", "quint64", "uchar", "ushort", "uint", "ulong",
+}
+
+_TYPE_NOISE = re.compile(
+    r"\b(const|volatile|static|mutable|inline|extern|register|typename|struct|"
+    r"class|enum|unsigned|signed|long|short)\b")
+
+
+def _normalize_type(type_text: str) -> str:
+    """Declared type -> the class name a method call should resolve against.
+
+    `const QString &` -> `QString`; `std::shared_ptr<Foo>` -> `shared_ptr`
+    (its methods are not Foo's, so resolving into Foo would be a lie).
+    Built-in types return "" so they never become a lookup key.
+    """
+    if not type_text:
+        return ""
+    t = _strip_template_args(type_text)
+    t = _TYPE_NOISE.sub(" ", t)
+    t = t.replace("*", " ").replace("&", " ")
+    parts = [p for p in re.split(r"[\s:]+", t) if p]
+    if not parts or parts[-1] in _BUILTIN_TYPES:
+        return ""
+    if parts[0].startswith("std") or "std" in t.split("::"):
+        # keep the wrapper type, not its template argument
+        parts = [p for p in parts if p != "std"]
+        return parts[0] if parts else ""
+    return parts[-1]
+
+
 def _callee_text(src: bytes, fn_node) -> str:
+    """Text of a callee, **keeping its receiver**.
+
+    `res.append(x)` -> `res.append`. Returning the bare `append` is what let a
+    QString method call resolve to an unrelated `TextForm::append`, and made the
+    caller's `uses` list name a function it never calls.
+    """
     t = fn_node.type
     if t in ("identifier", "qualified_identifier", "field_identifier",
              "template_function", "destructor_name", "operator_name"):
         return _text(src, fn_node)
     if t == "field_expression":
-        field = _child_by_field(fn_node, "field")
-        if field is not None:
-            return _text(src, field)
-        return _text(src, fn_node)
+        return _text(src, fn_node)          # receiver + "->"/"." + field
     if t == "template_function":
         return _text(src, fn_node)
     # fallback

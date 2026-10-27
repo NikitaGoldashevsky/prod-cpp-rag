@@ -125,6 +125,13 @@ def build_server(service: Service, chat=None):
         inheritance, every call it makes and every call made to it, the
         exception sites (with whether each is inside a try/catch), the exact
         fact card, and the entity's source text.
+
+        `calls` is scope-resolved (own class, bases, typed receivers, same-file
+        free functions). Callees it could not resolve are listed in `uses` with
+        their receiver — treat those as "unknown or outside the index", never as
+        a call to a project function. For a class, `declared_in_index: false`
+        means its header is outside the indexed subtree, and `first_member`
+        points at real code instead of an empty line range.
         """
         return _safe(service.entity, name, index=index or None)
 

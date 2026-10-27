@@ -219,7 +219,8 @@ over its stdin/stdout, and nothing is exposed on the network.
 list_indexes()                       indexes, roots, sizes, freshness summary
 index_status(name="")                per-folder hashes + changed/added/removed
 search_code(query, index="", top_k=8)  linked entities + fact cards + chunks
-get_entity(name, index="")           signature, callers, callees, throws, source
+get_entity(name, index="")           signature, callers, callees, throws, source,
+                                     declared_in_index / first_member for classes
 get_neighbours(name, index="", hops=1) one-hop graph expansion
 find_symbol(pattern, index="", limit=50) substring or glob, ranked
 read_chunk(chunk_id, index="")       one chunk by id
@@ -246,7 +247,7 @@ The canonical entry is in `examples/mcp-config.json`:
   "mcpServers": {
     "prod-rag": {
       "command": "/home/YOU/PROD_RAG/.venv/bin/prod-rag",
-      "args": ["mcp"]
+      "args": ["mcp", "--store", "neo4j"]
     }
   }
 }
@@ -261,8 +262,13 @@ project-level `.mcp.json` or an equivalent settings entry. If the harness has a
 CLI for adding servers, use it and point it at the same command:
 
 ```bash
-<harness> mcp add prod-rag /home/YOU/PROD_RAG/.venv/bin/prod-rag mcp
+<harness> mcp add prod-rag /home/YOU/PROD_RAG/.venv/bin/prod-rag mcp --store neo4j
 ```
+
+`--store neo4j` is not optional if the graph is the source of truth. With the
+memory default the server answers from the JSON index instead — same answers for
+structure, but it re-parses that index per process (seconds on a large
+submodule) and the Neo4j dataset checks in `list_indexes` disappear.
 
 `AGENTS.md` in this repository is written to be handed to an agent so it can do
 the installation itself.
@@ -391,6 +397,43 @@ plus control-flow facts per callable: `has_try_catch` and `throw_sites`
 Exception handling is modelled as a fact, not a text match — that is what makes
 "is this call guarded?" answerable.
 
+### The call graph, and how far to trust it
+
+`CALLS` is resolved by C++ scoping, not by name matching:
+
+1. the caller's own class, then its bases (`SingleTimer::toLable` calling
+   `deltaTime()` finds `AlarmClock::deltaTime`);
+2. a receiver with a known type — a parameter, a local (`QString res;`), or a
+   field of the caller or a base (`client_.connect()` → `TcpClient::connect`);
+3. a free function in the same file, then the same directory;
+4. a free function that is unambiguous in the whole corpus;
+5. `Type(args)` → that type's constructor.
+
+Anything else becomes `CALLS_EXTERNAL` with the **receiver kept** (`res.append`,
+`ip_.c_str`, `::connect`), which is the honest answer: the callee is outside the
+indexed tree or its receiver type is unknown. An unknown receiver is never
+guessed — that guess is what made a `QString::append` call look like
+`TextForm::append`.
+
+Two consequences worth knowing:
+
+- A call through a **container or smart pointer** (`vector_.size()`) lands in
+  `CALLS_EXTERNAL`: the receiver type is `std::vector`, not the element type.
+- A leading `::` means global scope, so `::connect(...)` inside
+  `TcpClient::connect` is the libc call and produces no self-edge.
+
+Measured on a generated 200-caller corpus built to reproduce the reported
+failures (same-named methods in every class, inheritance chains, member calls
+through locals and fields, explicit `::` calls): precision **0.857 → 1.000**,
+recall **0.750 → 1.000**. On `cct-app` the edges that changed were exactly the
+bad ones: `Server::handleClient → Vector3::toString` (a name collision) is gone,
+`config::loadFromJson → DeviceState` is now `DeviceState::DeviceState`, and
+`Server::handleClient → Vector3::distanceTo` now appears.
+
+Classes: `get_entity` reports `declared_in_index` and, when a class is known only
+through its method definitions (its header lives outside the indexed subtree), a
+`first_member` you can jump to instead of `line_start: 0`.
+
 ### Repository layout
 
 ```
@@ -418,6 +461,11 @@ you change it, change it there too and re-run the parity check.
   exceptions thrown unguarded?") links no entity; the search still returns the
   most relevant chunks and their fact cards, but it is weaker than an identifier
   query.
+- **The call graph is a static, single-file-scope approximation.** It resolves
+  through declared types, not through templates, `auto`, or virtual dispatch: a
+  call through an unknown variable is reported as external rather than guessed,
+  and overrides are not linked to the base declaration. Treat `calls`/`callers`
+  as strong evidence and confirm with the source when the answer turns on it.
 - **Generic words can drown specific ones.** In a large project, "client" may
   link a field named `client_` before the class that actually answers the
   question. Prefer naming the symbol.
