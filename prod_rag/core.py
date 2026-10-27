@@ -191,6 +191,10 @@ class Entity:
     is_definition: bool = True      # False for prototypes / in-class declarations
     has_try_catch: bool = False
     throw_sites: list[dict] = field(default_factory=list)  # {type, guarded, line}
+    # C++ namespace it was declared in (`NvTaskManager`). The qualified name
+    # stays `Class::method` so call resolution is unaffected; this is what makes
+    # `NvTaskManager::OgzTask` findable when a developer writes the full name.
+    ns: str = ""
 
 
 @dataclass
@@ -244,6 +248,7 @@ class CppOntology:
         # file -> the include strings it wrote, used to join a header to the
         # source that includes it
         self._include_paths: dict[str, list[str]] = {}
+        self._cpp_ns: list[str] = []
 
     # ---- public -----------------------------------------------------------
     def prescan(self, source_text: str):
@@ -395,7 +400,15 @@ class CppOntology:
             elif t in self._SCOPE_WRAPPERS:
                 body = node.child_by_field_name("body")
                 kids = body.children if body is not None else node.children
+                pushed = False
+                if t == "namespace_definition":
+                    nm = node.child_by_field_name("name")
+                    inner = _text(self.src_bytes, nm) if nm is not None else ""
+                    self._cpp_ns.append(inner or "")
+                    pushed = True
                 self._dispatch(kids, global_block_nodes)
+                if pushed:
+                    self._cpp_ns.pop()
             elif t in self._COND_WRAPPERS:
                 # keep the conditional itself out of the global chunk text;
                 # its declarations are handled individually
@@ -666,6 +679,7 @@ class CppOntology:
         body_node = _child_by_field(node, "body")
         ent = Entity(id=cid, kind=kind, name=name, qname=qname,
                      parent=scope_id,
+                     ns="::".join(n for n in self._cpp_ns if n),
                      file=self._cur_rel,
                      line_start=node.start_point[0] + 1, line_end=node.end_point[0] + 1,
                      # `class Foo;` is a forward declaration, not the class.
@@ -792,7 +806,8 @@ class CppOntology:
             return
         ret = _declarator_return_type(self.src_bytes, node, fd)
         ent = Entity(id=f"{cls_id}::{name}", kind=_callable_kind(name, cls_name), name=name,
-                     qname=f"{cls_name}::{name}", parent=cls_id, return_type=ret,
+                     qname=f"{cls_name}::{name}", parent=cls_id,
+                     ns="::".join(n for n in self._cpp_ns if n), return_type=ret,
                      file=self._cur_rel, is_definition=False,
                      params=_parse_params(self.src_bytes, fd), access=access,
                      is_virtual=_has_descendant(node, "virtual") or "virtual" in _text(self.src_bytes, node),
@@ -868,6 +883,7 @@ class CppOntology:
         base = f"{parent_id}::{name}" if parent_id else self._qid("func", qname)
         head = _text(self.src_bytes, node).split("(", 1)[0]
         ent = Entity(id=base, kind=kind, name=name, qname=qname, parent=parent_id,
+                     ns="::".join(n for n in self._cpp_ns if n),
                      return_type=ret, params=params, access=access, file=self._cur_rel,
                      is_const=_has_descendant(fd, "type_qualifier") and
                               "const" in _text(self.src_bytes, fd).rsplit(")", 1)[-1],

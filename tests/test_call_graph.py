@@ -514,6 +514,40 @@ def check_header_source_split(tmp: str) -> bool:
     return ok
 
 
+LOOKUP_SRC = r"""
+#ifndef LOOKUP_H
+#define LOOKUP_H
+
+namespace NvTaskManager {
+struct OgzTask {
+    OgzTask() = default;
+    OgzTask(int a);
+    void run();
+    int id_;
+};
+}
+
+class Clock { public: void tick(); int hour_; };
+class Gun { public: void fire(); };
+
+#endif
+"""
+
+LOOKUP_CPP = r"""
+#include "lookup.h"
+
+using OgzTask = NvTaskManager::OgzTask;
+
+// A parameter that shares its name with a class. `get_entity("Clock")` used to
+// return this and report a symbol with no members.
+void shadow(int Clock) {}
+
+namespace NvTaskManager {
+OgzTask::OgzTask(int a) {}
+void OgzTask::run() {}
+}
+"""
+
 OVERLOAD_SRC = r"""
 class Server {
 public:
@@ -523,6 +557,47 @@ public:
     Server& operator=(const Server&) = delete;
 };
 """
+
+
+def check_lookup(tmp: str) -> bool:
+    """A bare name must resolve to the symbol, not to a parameter or an alias."""
+    root = os.path.join(tmp, "lookup")
+    os.makedirs(root)
+    with open(os.path.join(root, "lookup.h"), "w") as f:
+        f.write(LOOKUP_SRC)
+    with open(os.path.join(root, "lookup.cpp"), "w") as f:
+        f.write(LOOKUP_CPP)
+    idx_mod.build("lookup", root, verbose=False)
+    onto = idx_mod.load("lookup").onto
+    from prod_rag.store import MemoryStore as _MS
+    st = _MS(onto)
+    ok = True
+
+    for name, kind in (("Clock", "Class"), ("Gun", "Class"),
+                       ("OgzTask", "Struct")):
+        e = st.entity(name)
+        if not e or e["kind"] != kind:
+            print(f"  FAIL  entity({name!r}) -> {e and e['kind']}, expected {kind}")
+            ok = False
+    # the namespace-qualified form a developer would write
+    for name in ("NvTaskManager::OgzTask", "NvTaskManager::OgzTask::run"):
+        e = st.entity(name)
+        if not e:
+            print(f"  FAIL  entity({name!r}) not found")
+            ok = False
+    if not ok:
+        return False
+    print("  OK    bare and namespace-qualified lookups hit the symbol")
+
+    # overloads behind one member name must be visible
+    e = st.entity("OgzTask")
+    over = (e or {}).get("overloaded_members") or {}
+    if over.get("OgzTask") != 2:
+        print(f"  FAIL  overloaded_members hides the constructors: {over}")
+        ok = False
+    else:
+        print(f"  OK    overloaded members disclosed: {over}")
+    return ok
 
 
 def check_overload_identity(tmp: str) -> bool:
@@ -854,6 +929,8 @@ def run(tmp: str) -> int:
     if not check_header_source_split(tmp):
         ok = False
     if not check_overload_identity(tmp):
+        ok = False
+    if not check_lookup(tmp):
         ok = False
     if not check_overload_order(tmp):
         ok = False

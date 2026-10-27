@@ -189,6 +189,35 @@ def overload_note(qname: str, siblings: list[dict]) -> dict:
     }
 
 
+# What a bare name should resolve to, best first. A `Parameter` or a `TypeAlias`
+# that happens to share the name must never answer before the class: on a real
+# tree `get_entity("Clock")` returned a function parameter with no members, which
+# reads exactly like "a symbol that has nothing in it".
+_LOOKUP_RANK = {
+    "Class": 0, "Struct": 0, "Function": 1, "Method": 1,
+    "Constructor": 1, "Destructor": 1, "Field": 2, "TypeAlias": 3,
+    "GlobalBlock": 4, "Header": 5, "File": 6, "Parameter": 7,
+}
+
+
+def lookup_rank(kind: str) -> int:
+    return _LOOKUP_RANK.get(kind, 4)
+
+
+def member_overloads(names: list[str], counts: list[int]) -> dict:
+    """Flag class members that are overloaded.
+
+    `members` is a list of names, so two constructors appear once. A caller
+    reading `members` had no way to know the set was short — this says which
+    names have more than one entity behind them.
+    """
+    over = {}
+    for n, c in zip(names, counts):
+        if c > 1:
+            over[n] = c
+    return {"overloaded_members": over} if over else {}
+
+
 def class_location(declared_line: int, members: list[dict],
                    is_definition: bool = True) -> dict:
     """Honest location for a class/struct.
@@ -307,11 +336,23 @@ class MemoryStore:
                     if 0 <= k < len(ids):
                         return ids[k]
         low = name.lower()
+        # `NvTaskManager::OgzTask`: the qname is `OgzTask`, so also match the
+        # namespace-qualified form a developer would actually write.
+        for eid, e in onto.entities.items():
+            q = (e.qname or "").lower()
+            nsv = (getattr(e, "ns", "") or "").lower()
+            if q and nsv and f"{nsv}::{q}" == low:
+                return eid
         exact = [eid for eid, e in onto.entities.items()
-                 if (e.qname or "").lower() == low or e.name.lower() == low]
+                 if (e.qname or "").lower() == low
+                 or (e.name.lower() == low and e.kind not in ("Parameter", "File",
+                                                              "GlobalBlock", "Header"))]
         if exact:
-            exact.sort(key=lambda eid: (not onto.entities[eid].is_definition,
-                                        onto.entities[eid].kind in ("Parameter", "File")))
+            exact.sort(key=lambda eid: (lookup_rank(onto.entities[eid].kind),
+                                        not onto.entities[eid].is_definition,
+                                        0 if "::" in (onto.entities[eid].qname or "")
+                                        else 1,
+                                        len(onto.entities[eid].qname or "")))
             return exact[0]
         # Fuzzy fallback: never a file/include stub. `entity("NvDateTime")`
         # used to resolve to the `#include "nvdatetime.h"` Header node and
@@ -393,6 +434,15 @@ class MemoryStore:
                                onto._out(eid, "hasMethod") +
                                onto._out(eid, "hasConstructor") +
                                onto._out(eid, "hasField")}),
+            # `members` de-duplicates by name, so a class with two constructors
+            # listed one and nothing said the set was short.
+            **member_overloads(
+                [onto.entities[o].name for o in
+                 onto._out(eid, "hasMethod") + onto._out(eid, "hasConstructor")
+                 + onto._out(eid, "hasField") if o in onto.entities],
+                [len(onto._by_qname.get(onto.entities[o].qname or "", []))
+                 for o in onto._out(eid, "hasMethod") + onto._out(eid, "hasConstructor")
+                 + onto._out(eid, "hasField") if o in onto.entities]),
             **loc,
             "fact_card": onto._card(e),
             "code": chunk["text"] if chunk else e.code,
@@ -635,6 +685,8 @@ class Neo4jStore:
                          "params_json": json.dumps(e.get("params") or []),
                          "throw_json": json.dumps(e.get("throw_sites") or []),
                          "fact_card": e.get("fact_card") or ""}
+                if e.get("ns"):
+                    props["ns"] = e["ns"]
                 for k in ("return_type", "type_ref", "parent", "code", "access"):
                     if e.get(k):
                         props[k] = e[k]
@@ -916,13 +968,36 @@ class Neo4jStore:
             if num.isdigit():
                 name, nth = base, int(num) - 1
         with self._session() as s:
+            # `size(qname) ASC` used to decide this, and a Parameter's qname is
+            # the empty string — so on a real tree `get_entity("Clock")` returned
+            # a function parameter with no members, which reads exactly like "a
+            # symbol that has nothing in it". Rank by kind instead.
+            kind_rank = ("CASE e.kind "
+                         + " ".join(f"WHEN '{k}' THEN {i}"
+                                    for k, i in sorted(_LOOKUP_RANK.items(),
+                                                       key=lambda kv: kv[1]))
+                         + " ELSE 4 END")
             rec = s.run(
                 "MATCH (e:Entity {dataset:$ds}) "
-                "WHERE e.qname = $n OR e.name = $n "
-                "   OR e.qname_lc = $lc OR e.name_lc = $lc OR e.id = $n "
-                "RETURN e ORDER BY coalesce(e.is_definition,true) DESC, "
+                "WHERE e.id = $n OR e.qname = $n "
+                "   OR (e.name = $n AND NOT e:Parameter AND NOT e:File "
+                "       AND NOT e:GlobalBlock AND NOT e:Header) "
+                "   OR e.qname_lc = $lc "
+                "   OR (e.name_lc = $lc AND NOT e:Parameter AND NOT e:File "
+                "       AND NOT e:GlobalBlock AND NOT e:Header) "
+                f"RETURN e ORDER BY {kind_rank}, "
+                "  coalesce(e.is_definition,true) DESC, "
+                "  CASE WHEN e.qname CONTAINS '::' THEN 1 ELSE 0 END, "
                 "  size(coalesce(e.qname,'')) ASC LIMIT 1",
                 n=name, lc=name.lower(), ds=ds).single()
+            if not rec:
+                # `Ns::Class` where the qname is the bare class name.
+                rec = s.run(
+                    "MATCH (e:Entity {dataset:$ds}) "
+                    "WHERE e.ns IS NOT NULL AND e.ns <> '' "
+                    "AND toLower(e.ns) + '::' + toLower(coalesce(e.qname,'')) = $lc "
+                    f"RETURN e ORDER BY {kind_rank} LIMIT 1",
+                    lc=name.lower(), ds=ds).single()
             if not rec:
                 # Same rule as MemoryStore: an include/file stub is never a
                 # useful answer to "tell me about this symbol".
@@ -931,7 +1006,8 @@ class Neo4jStore:
                     "WHERE (e.qname_lc CONTAINS $lc OR e.name_lc CONTAINS $lc) "
                     "AND NOT e:Header AND NOT e:File "
                     "AND NOT e:GlobalBlock AND NOT e:Parameter "
-                    "RETURN e ORDER BY size(coalesce(e.qname,'')) ASC LIMIT 1",
+                    f"RETURN e ORDER BY {kind_rank}, "
+                    "  size(coalesce(e.qname,'')) ASC LIMIT 1",
                     lc=name.lower(), ds=ds).single()
             if not rec:
                 return None
@@ -1019,6 +1095,15 @@ class Neo4jStore:
                                      if r["t"] == "OVERRIDES"}),
             "members": sorted(set(objs("HAS_METHOD") + objs("HAS_CONSTRUCTOR")
                                   + objs("HAS_FIELD"))),
+            **member_overloads([r["oname"] for r in rel
+                                if r["t"] in ("HAS_METHOD", "HAS_CONSTRUCTOR",
+                                              "HAS_FIELD")],
+                               [len([1 for x in rel
+                                     if x["t"] == "HAS_METHOD"
+                                     and x["oname"] == r["oname"]])
+                                for r in rel if r["t"] in ("HAS_METHOD",
+                                                           "HAS_CONSTRUCTOR",
+                                                           "HAS_FIELD")]),
             **loc,
             "fact_card": node.get("fact_card") or "",
             "code": (code["text"] if code else node.get("code") or ""),

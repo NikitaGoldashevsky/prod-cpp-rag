@@ -242,6 +242,11 @@ same-file free functions), never by matching a bare method name. So:
   SLOT(y()))` names handlers; it invokes nothing.
 - `find_symbol` returns `count` (this page) and `total` (all matches). Quote
   `total` when reporting how many symbols match.
+- `get_entity` accepts both the bare and the namespace-qualified name, and
+  ranks `Class`/`Struct` above parameters and aliases — so a bare class name is
+  safe to ask for.
+- `overloaded_members` marks class members that have more than one entity
+  behind the name; `members` lists each name once.
 
 If the tools do not appear: run the command by hand in a terminal. It should
 print nothing and wait for stdin. Any output before the handshake breaks the

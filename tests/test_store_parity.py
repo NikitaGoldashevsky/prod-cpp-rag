@@ -151,6 +151,16 @@ def main(argv) -> int:
         print(f"  OK    search returns facts + chunks on {len(QUESTIONS)} questions; "
               "symbol queries surface the symbol")
 
+        # ---- lookup parity: same entity, same kind, both backends --------
+        # A Parameter with an empty qname used to win the Neo4j lookup, so the
+        # same name answered differently on the two backends.
+        for q in ("Server", "TcpClient", "CommandHandler", "MenuItem::execute"):
+            a, b = mem.entity(q), neo.entity(q)
+            if (a or {}).get("kind") != (b or {}).get("kind"):
+                fail(f"lookup {q!r}: memory={a and a.get('kind')} "
+                     f"neo4j={b and b.get('kind')}")
+        print("  OK    lookup returns the same kind on both backends")
+
         # ---- class location parity ---------------------------------------
         for q in ("Server", "TcpClient", "CommandHandler"):
             a, b = mem.entity(q), neo.entity(q)

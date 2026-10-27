@@ -248,6 +248,26 @@ appears only inside someone else's qualifier does not count — asking about
 one overload only. Pass an id from that list — bare (`Api::show#2`) or prefixed
 (`core::class:src/Api::show#2`) — to look at another.
 
+A class reports `overloaded_members: {name: count}` when several entities share
+a member name, because `members` is a list of *names* and two constructors
+appear there once.
+
+### Name lookup
+
+A bare name resolves to the symbol, ranked by kind: `Class`/`Struct` first, then
+callables, then fields and aliases. A function *parameter* that happens to share
+the name never wins — on a real tree `get_entity("Clock")` returned a parameter
+with no members, which reads exactly like a symbol that has nothing in it.
+
+A C++ namespace is recorded on every entity, so the name a developer would
+actually write also works:
+
+```
+get_entity("OgzTask")                    -> the Struct
+get_entity("NvTaskManager::OgzTask")     -> the same Struct
+get_entity("NvTaskManager::OgzTask::run") -> the method
+```
+
 ### Wiring it into a harness
 
 Any MCP client needs the command, its arguments, and optionally `PROD_RAG_DATA`.
