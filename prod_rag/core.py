@@ -232,10 +232,15 @@ class CppOntology:
         # (caller_id, callee_text, n_args). The callee keeps its receiver
         # (`res.append`, not `append`) — dropping it is what let a QString
         # method call collide with an unrelated `TextForm::append`.
+        self._rel_keys: set[tuple] = set()
         self._raw_calls: list[tuple[str, str, int]] = []
         self._raw_refs: list[tuple[str, str]] = []
         # caller_id -> {local variable name: declared type}
         self._locals: dict[str, dict[str, str]] = {}
+        # file-scope variable name -> declared type (`static ComplexTimer t;`).
+        # Without this, a call through a file-static object had an unknown
+        # receiver and was reported external although the type is in the tree.
+        self._globals: dict[str, str] = {}
 
     # ---- public -----------------------------------------------------------
     def prescan(self, source_text: str):
@@ -262,6 +267,7 @@ class CppOntology:
         self.prescan(source_text)
         self._build_one(source_text, filename or self.filename)
         self._resolve_calls_and_refs()
+        self._link_overrides()
         self._finalise_chunks()
         return self
 
@@ -287,6 +293,7 @@ class CppOntology:
         lexical search.
         """
         self._resolve_calls_and_refs()
+        self._link_overrides()
         self._finalise_chunks()
         if with_retriever:
             self.build_retriever()
@@ -457,8 +464,16 @@ class CppOntology:
         if existing.kind in callables and ent.kind in callables:
             if _signature(existing) != _signature(ent):
                 return None                      # different parameters -> overloads
+            # Keep whichever has a body, but the declaration is where
+            # `virtual`, `static`, `const` and the access specifier usually
+            # live, so the survivor must inherit them. Whichever file is read
+            # first decides which direction this runs.
             if ent.is_definition and not existing.is_definition:
+                _absorb(ent, existing)
                 return ent                       # upgrade declaration -> definition
+            if existing.is_definition and not ent.is_definition:
+                _absorb(existing, ent)
+                return existing
             return existing                      # same signature: keep the better one
         if existing.kind == ent.kind == "Field":
             return ent if (ent.code and not existing.code) else existing
@@ -502,8 +517,19 @@ class CppOntology:
             i += 1
         return f"{base}#{i}"
 
+    # Predicates where a repeat means nothing: a class does not "have" the same
+    # method twice because it both declared and defined it.
+    _SET_PREDICATES = {"hasMethod", "hasConstructor", "hasField", "hasParameter",
+                       "declares", "includes", "overrides", "inheritsFrom",
+                       "initializes", "aliasOf"}
+
     def _rel(self, s: str, p: str, o: str, literal: bool = False,
              guarded: bool | None = None):
+        if p in self._SET_PREDICATES:
+            key = (s, p, o)
+            if key in self._rel_keys:
+                return
+            self._rel_keys.add(key)
         self.relations.append(Relation(s, p, o, literal, guarded))
         self._out_index = None          # invalidate the adjacency caches
         self._guard_index = None
@@ -601,15 +627,20 @@ class CppOntology:
         name = _text(self.src_bytes, name_node) if name_node else "<anonymous>"
         cid = self._qid("class", name)
         kind = "Class" if node.type == "class_specifier" else "Struct"
+        body_node = _child_by_field(node, "body")
         ent = Entity(id=cid, kind=kind, name=name, qname=name,
                      file=self._cur_rel,
                      line_start=node.start_point[0] + 1, line_end=node.end_point[0] + 1,
+                     # `class Foo;` is a forward declaration, not the class.
+                     # Marked as a definition it became the address a call
+                     # resolved to — pointing into an unrelated header.
+                     is_definition=body_node is not None,
                      code=_text(self.src_bytes, node))
         self._add(ent)
         self._rel(self._cur_file_id, "declares", cid)
         self._class_header_relations(node, cid)
 
-        body = _child_by_field(node, "body")
+        body = body_node
         if not body:
             return
         current_access = "private" if kind == "Class" else "public"
@@ -772,11 +803,18 @@ class CppOntology:
         kind = "Constructor" if is_ctor else ("Destructor" if is_dtor else
                                               ("Method" if scope and not in_namespace else "Function"))
         base = f"{parent_id}::{name}" if parent_id else self._qid("func", qname)
+        head = _text(self.src_bytes, node).split("(", 1)[0]
         ent = Entity(id=base, kind=kind, name=name, qname=qname, parent=parent_id,
                      return_type=ret, params=params, access=access, file=self._cur_rel,
                      is_const=_has_descendant(fd, "type_qualifier") and
                               "const" in _text(self.src_bytes, fd).rsplit(")", 1)[-1],
                      is_noexcept=_has_descendant(fd, "noexcept"),
+                     # An out-of-line definition rarely repeats `virtual`; the
+                     # `override` / `final` specifiers are the markers that
+                     # survive there, and without them is_virtual was always
+                     # False for every method with its body in a .cpp.
+                     is_virtual=bool(re.search(r"\b(virtual|override|final)\b", head)),
+                     is_static=bool(re.search(r"\bstatic\b", head)),
                      line_start=node.start_point[0] + 1, line_end=node.end_point[0] + 1,
                      code=_text(self.src_bytes, node))
         self._add(ent)
@@ -830,6 +868,8 @@ class CppOntology:
     def _handle_top_declaration(self, node):
         text = _text(self.src_bytes, node)
         fd = _find_function_declarator(node)
+        if fd is None:
+            self._record_global_vars(node)
         if fd is not None:
             name = _declarator_name(self.src_bytes, fd)
             ent = Entity(id=self._qid("func", name or "?"), kind="Function",
@@ -841,9 +881,24 @@ class CppOntology:
                          code=text)
             self._add(ent)
             self._rel(self._cur_file_id, "declares", ent.id)
-        else:
-            # global variable declaration -> put in global block chunk only
-            pass
+        # (a plain global variable has no entity; its chunk is the global block)
+
+    def _record_global_vars(self, node) -> None:
+        """File-scope variables: remember name -> declared type."""
+        tnode = _child_by_field(node, "type")
+        if tnode is None:
+            return
+        tname = _text(self.src_bytes, tnode)
+        if not tname:
+            return
+        try:
+            decls = node.children_by_field_name("declarator")
+        except AttributeError:                            # pragma: no cover
+            decls = []
+        for d in decls:
+            nm = _field_name(self.src_bytes, d)
+            if nm:
+                self._globals.setdefault(nm, tname)
 
     def index_names(self) -> None:
         """(Re)build the name -> id indexes from `self.entities`.
@@ -933,8 +988,13 @@ class CppOntology:
         ctx = {"by_suffix": by_suffix, "members": members, "bases": bases,
                "classes": classes_by_name, "fields": self._field_types()}
 
+        unknown_base_ids = {cid for cid, bs in bases.items()
+                            if any(b not in classes_by_name for b in bs)}
         seen_calls: set[tuple[str, str]] = set()
         for caller, callee, nargs, guarded in self._raw_calls:
+            unknown_base = caller in unknown_base_ids or (
+                self.entities.get(caller) is not None
+                and self.entities[caller].parent in unknown_base_ids)
             local = self._resolve_call(callee, self.entities.get(caller), ctx,
                                        nargs=nargs)
             # A method that calls a *different overload of itself* resolves to
@@ -950,8 +1010,38 @@ class CppOntology:
                 self._rel(caller, "calls", local, guarded=guarded)
                 seen_calls.add((caller, local))
             else:
-                self._rel(caller, "callsExternal", _external_label(callee),
-                          literal=True)
+                label = _external_label(callee)
+                if (nargs >= 0 and "(" not in label and "." not in label
+                        and "->" not in label and "::" not in label
+                        and label[:1].isupper()):
+                    label = f"{label}()"   # `Type(args)` constructed, right here
+                self._rel(caller, "callsExternal", label, literal=True)
+
+        # A call can appear twice: `getDateTime()` resolved from one site and,
+        # from another site in the same method, as a fragment. Listing both
+        # makes the reader think one call was unresolved.
+        resolved_names: dict[str, set[str]] = {}
+        for r in self.relations:
+            if r.p != "calls":
+                continue
+            o = self.entities.get(r.o)
+            if o is not None:
+                resolved_names.setdefault(r.s, set()).add(o.name)
+        keep = []
+        for r in self.relations:
+            if r.p == "callsExternal" and r.s in resolved_names:
+                label = r.o or ""
+                # Only a fragment with NO receiver at all can be the same call
+                # reported twice. A label that kept its receiver is a different
+                # call site and must stay.
+                if not any(tok in label for tok in (".", "->", "::", "(")):
+                    if label in resolved_names[r.s]:
+                        continue
+            keep.append(r)
+        if len(keep) != len(self.relations):
+            self.relations = keep
+            self._out_index = None
+            self._guard_index = None
 
         for caller, ref in self._raw_refs:
             local = self._resolve_call(ref, self.entities.get(caller), ctx)
@@ -1106,6 +1196,42 @@ class CppOntology:
         return None
 
     # ---- resolution helpers ----------------------------------------------
+    def _link_overrides(self) -> None:
+        """Record which methods override which (virtual dispatch).
+
+        A call through a base pointer lands on the base method, but at runtime
+        it reaches the derived override. Without an `overrides` edge the derived
+        method looks uncalled and the base method looks like the whole story —
+        so "what breaks if I change X" was wrong for exactly the methods this
+        codebase uses most.
+        """
+        ctx = self._resolution_context()
+        members, bases, classes = ctx["members"], ctx["bases"], ctx["classes"]
+        for r in list(self.relations):
+            if r.p != "inheritsFrom":
+                continue
+            derived = r.s
+            base_id = self._class_for(r.o, self.entities.get(derived, Entity(
+                id="", kind="", name="")).file if derived in self.entities else None,
+                ctx)
+            if not base_id or base_id not in self.entities:
+                continue
+            for name, ids in list(members.get(derived, {}).items()):
+                for did in ids:
+                    de = self.entities.get(did)
+                    if de is None:
+                        continue
+                    for bid in members.get(base_id, {}).get(name, []):
+                        be = self.entities.get(bid)
+                        if be is None or be.id == de.id:
+                            continue
+                        if _signature(be) != _signature(de):
+                            continue
+                        # C++ does not require the derived declaration to
+                        # repeat `virtual`; inheriting it is enough.
+                        if be.is_virtual or de.is_virtual:
+                            self._rel(did, "overrides", be.id)
+
     def _resolution_context(self) -> dict:
         """Indexes `_resolve_call` needs: members, bases, classes, suffixes."""
         by_suffix: dict[str, list[str]] = {}
@@ -1260,6 +1386,9 @@ class CppOntology:
         local = self._locals.get(caller.id, {}).get(var)
         if local:
             return local
+        gl = self._globals.get(var)
+        if gl:
+            return gl
         ctx = ctx or self._resolution_context()
         fields = ctx["fields"]
         cls = caller.parent
@@ -1408,6 +1537,14 @@ class CppOntology:
                 bits.append("has try/catch")
             elif calls or ext or e.throw_sites:
                 bits.append("NO try/catch: exceptions from calls are NOT handled here")
+            ov = [self._label(o) for o in self._out(e.id, "overrides")]
+            if ov:
+                bits.append("overrides: " + ", ".join(sorted(set(ov))))
+            ob = sorted({self._label(r.s) for r in self.relations
+                         if r.o == e.id and r.p == "overrides"})
+            if ob:
+                bits.append("overridden by (virtual dispatch reaches these): "
+                            + ", ".join(ob))
             if inits:
                 bits.append("initializes: " + ", ".join(inits))
             bits.append(f"lines {e.line_start}-{e.line_end}"
@@ -2024,6 +2161,22 @@ def _parse_params(src: bytes, fd) -> list[dict]:
     return params
 
 
+_CARRY_FLAGS = ("is_virtual", "is_static", "is_const", "is_noexcept")
+
+
+def _absorb(keep, other) -> None:
+    """Copy declaration-only attributes onto the entity that is kept."""
+    for f in _CARRY_FLAGS:
+        if getattr(other, f, False) and not getattr(keep, f, False):
+            setattr(keep, f, True)
+    if not keep.access:
+        keep.access = other.access
+    if not keep.return_type:
+        keep.return_type = other.return_type
+    if not keep.params:
+        keep.params = other.params
+
+
 def _signature(ent) -> tuple:
     """Identity of an overload: parameter types plus const-ness.
 
@@ -2063,16 +2216,22 @@ def _strip_template_args(text: str) -> str:
 
 
 def _external_label(callee: str) -> str:
-    """A clean, single-line label for a callee we could not resolve.
+    """A short, honest label for a callee the resolver could not bind.
 
-    `uses` is shown to humans and to models, so raw expression text with
-    embedded newlines (`QString("%1")\n   .arg(...)`) is unreadable and looks
-    like a defect. What is kept is the last *named* hop, so the reader can see
-    where the call came from:
+    `uses` is read by humans and by models, so the label has to say *what kind
+    of thing* this is — a bare name was ambiguous in four different ways, all
+    reported from a real audit:
 
-        res.append                      -> res.append
-        rec->getSettings()->GLNPcode(x)  -> getSettings()->GLNPcode
-        QString("%1").arg(x).arg(y)      -> arg
+        QString(...)                     -> QString()      (a construction)
+        QString("%1").arg(x).arg(y)      -> QString().arg   (a chain on it)
+        rec->getSettings()->M(x)         -> getSettings()->M
+        hide(2)                          (unqualified, unresolved) -> hide
+
+    Whether an unresolved bare name is an inherited member or a free function
+    cannot be known from the call site; when the caller's class has a base
+    outside the index the *entity* says so (`inherits_unknown`), rather than
+    every label carrying a guess.
+    
     """
     t = " ".join((callee or "").split())
     if not t:
@@ -2081,19 +2240,36 @@ def _external_label(callee: str) -> str:
         return t
     hops = list(re.finditer(r"(\.|->)\s*(~?[A-Za-z_]\w*)", t))
     if not hops:
-        # no member access at all: `std::to_string(x)` -> `to_string`, `f(1)` -> `f`
-        head = t.split("(", 1)[0]
-        return head.split("::")[-1].strip() or t
+        # `Name(args)` / `ns::Name(args)` — a call, usually a construction
+        head = t.split("(", 1)[0].strip()
+        if "::" in head:
+            return head
+        if head[:1].isupper():
+            return f"{head}()"          # a type being constructed
+        return head
     last = hops[-1]
     if len(hops) >= 2:
         prev = hops[-2]
         gap = t[prev.end():last.start()]
-        # keep a receiver hop only when it is a plain name or a plain call:
-        # `getSettings()->M` -> getSettings()->M ; `"".arg()...` -> no receiver
         if gap.strip() in ("", "()"):
             return f"{prev.group(2)}{gap.strip()}{last.group(1)}{last.group(2)}"
+    # The receiver is the result of a call: label it with the call that
+    # produced it (`getInst()->getDateTime`, `QString().arg`), never with the
+    # outermost type name — that would invent a receiver that is not there.
+    before = t[:last.start()].rstrip()
+    if before.endswith(")") and last.group(1) == "->":
+        # pointer obtained from a call: the call is the interesting receiver
+        inner = re.search(r"([A-Za-z_]\w*)\s*\([^()]*\)$", before)
+        if inner:
+            return f"{inner.group(1)}()->{last.group(2)}"
+        return f"...->{last.group(2)}"
+    # `.` on the result of a call: a temporary. Name it by the type it was
+    # built from when the expression starts with one (`QString(...).arg(...)`),
+    # so the label is not mistaken for a free function called `arg`.
+    head = re.match(r"^([A-Za-z_]\w*)", t)
+    if head and head.group(1)[:1].isupper() and head.group(1) != last.group(2):
+        return f"{head.group(1)}().{last.group(2)}"
     return last.group(2)
-
 
 
 def _element_type(type_text: str) -> str:

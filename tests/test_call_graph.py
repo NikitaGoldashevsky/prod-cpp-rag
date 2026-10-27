@@ -281,6 +281,60 @@ void QtMgr::onTick() { hide(2); }
 void qtHelper() {}
 """
 
+# Virtual dispatch, a file-scope object, a forward declaration, and the shapes
+# an audit flagged as mislabelled in `uses`.
+VIRT_HEADER = r"""
+#ifndef VIRT_H
+#define VIRT_H
+
+class NvDateTime;                 // forward declaration only
+
+class BaseTimer
+{
+public:
+    virtual int deltaTime();
+    static void helper();
+};
+
+class NotifyClocks : public BaseTimer
+{
+public:
+    int deltaTime();              // override, `virtual` not repeated
+};
+
+class Mgr
+{
+public:
+    void timerEvent();
+    void formatting();
+};
+
+#endif
+"""
+
+VIRT_SOURCE = r"""
+#include "virt.h"
+
+static BaseTimer base_timer;      // file-scope object of an in-tree type
+
+int BaseTimer::deltaTime() { return 0; }
+void BaseTimer::helper() {}
+int NotifyClocks::deltaTime() { return 1; }
+
+void Mgr::timerEvent()
+{
+    base_timer.deltaTime();
+    BaseTimer* p = new NotifyClocks();
+    p->deltaTime();
+}
+
+void Mgr::formatting()
+{
+    QString("%1:%2").arg(1).arg(2);
+    NvDistanceFormat(3);
+}
+"""
+
 TEXTFORM = r"""
 class TextForm {
 public:
@@ -300,6 +354,10 @@ def build(tmp: str):
         f.write(SOURCE)
     with open(os.path.join(root, "textform.cpp"), "w") as f:
         f.write(TEXTFORM)
+    with open(os.path.join(root, "virt.h"), "w") as f:
+        f.write(VIRT_HEADER)
+    with open(os.path.join(root, "virt.cpp"), "w") as f:
+        f.write(VIRT_SOURCE)
     with open(os.path.join(root, "qtform.h"), "w") as f:
         f.write(QT_HEADER)
     with open(os.path.join(root, "qtform.cpp"), "w") as f:
@@ -311,6 +369,10 @@ def build(tmp: str):
     os.environ["PROD_RAG_DATA"] = os.path.join(tmp, "data")
     idx_mod.build("cg", root, verbose=False)
     return idx_mod.load("cg").onto
+
+
+def _has_use(onto, label: str) -> bool:
+    return any(r.p == "callsExternal" and r.o == label for r in onto.relations)
 
 
 def check_overload_order(tmp: str) -> bool:
@@ -458,6 +520,44 @@ def run(tmp: str) -> int:
     if e and "QtForm::keyPressEvent" in (e.get("calls") or []):
         print("  FAIL  base::keyPressEvent bound to itself")
         ok = False
+
+    # ---- a file-scope object has a type --------------------------------
+    # `static BaseTimer base_timer;` spells the type in the same file; a call
+    # through it was reported external with the receiver unknown.
+    expect("Mgr::timerEvent", "calls", "BaseTimer::deltaTime")
+
+    # ---- virtual dispatch is disclosed, not hidden ---------------------
+    # The static call lands on BaseTimer::deltaTime; at runtime it may reach
+    # NotifyClocks::deltaTime. Both facts must be visible.
+    base = load.entity("BaseTimer::deltaTime")
+    derived = load.entity("NotifyClocks::deltaTime")
+    if not base or base.get("overridden_by") != ["NotifyClocks::deltaTime"]:
+        print(f"  FAIL  base does not list its override: {base and base.get('overridden_by')}")
+        ok = False
+    if not derived or derived.get("overrides") != ["BaseTimer::deltaTime"]:
+        print(f"  FAIL  override does not name its base: {derived and derived.get('overrides')}")
+        ok = False
+    if not base or "overridden by" not in (base.get("fact_card") or ""):
+        print("  FAIL  fact card hides the override")
+        ok = False
+    print("  OK    virtual dispatch disclosed: base lists override, card says so")
+
+    # ---- a forward declaration is not a definition ---------------------
+    fwd = load.entity("NvDateTime")
+    if fwd and fwd.get("is_definition") is not False:
+        print(f"  FAIL  forward declaration claims to be a definition: {fwd.get('is_definition')}")
+        ok = False
+    print("  OK    forward declaration marked is_definition=False")
+
+    # ---- `uses` labels say what kind of thing they are -----------------
+    # Reported from an audit: type names looked like calls, a chained `.arg()`
+    # lost its receiver, and a construction looked like a variable.
+    for label, why in (("QString().arg", "chained call keeps its root"),
+                       ("NvDistanceFormat()", "a construction says so")):
+        if not _has_use(onto, label):
+            print(f"  FAIL  uses label missing: {label} ({why})")
+            ok = False
+    print("  OK    uses labels distinguish constructions from members")
 
     # ---- an overload of itself is not recursion ------------------------
     # `Form::show(int)` calls `show()`. Only one overload exists in the index,

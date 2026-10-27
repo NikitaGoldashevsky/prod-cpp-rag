@@ -363,8 +363,13 @@ class MemoryStore:
             "uses": sorted(set(onto._out(eid, "callsExternal"))),
             "initializes": [lab(o) for o in onto._out(eid, "initializes")],
             "inherits": onto._out(eid, "inheritsFrom"),
-            "inherited_by": [r.s for r in onto.relations
+            "inherited_by": [lab(r.s) for r in onto.relations
                              if r.o == eid and r.p == "inheritsFrom"],
+            # Virtual dispatch: a call through a base pointer reaches these at
+            # runtime even though the `calls` edge points at the declaration.
+            "overrides": [lab(o) for o in onto._out(eid, "overrides")],
+            "overridden_by": sorted({lab(r.s) for r in onto.relations
+                                     if r.o == eid and r.p == "overrides"}),
             "members": sorted({lab(o) for o in
                                onto._out(eid, "hasMethod") +
                                onto._out(eid, "hasConstructor") +
@@ -424,6 +429,7 @@ KIND_LABELS = ("File", "Header", "Class", "Struct", "Method", "Function",
                "GlobalBlock")
 
 REL_TYPES = {
+    "overrides": "OVERRIDES",
     "includes": "INCLUDES", "declares": "DECLARES", "hasMethod": "HAS_METHOD",
     "hasConstructor": "HAS_CONSTRUCTOR", "hasField": "HAS_FIELD",
     "hasParameter": "HAS_PARAMETER", "calls": "CALLS", "references": "REFERENCES",
@@ -962,8 +968,10 @@ class Neo4jStore:
             "return_type": node.get("return_type"),
             "type_ref": node.get("type_ref"),
             "params": json.loads(node.get("params_json") or "[]"),
-            "modifiers": [k for k in ("is_const", "is_static", "is_virtual", "is_noexcept")
-                          if node.get(k)],
+            # Same names as MemoryStore, which is what a caller reads: the
+            # `is_` prefix is a storage detail and leaked into the payload.
+            "modifiers": [k[3:] for k in ("is_const", "is_static", "is_virtual",
+                                          "is_noexcept") if node.get(k)],
             "has_try_catch": bool(node.get("has_try_catch", False)),
             "throw_sites": json.loads(node.get("throw_json") or "[]"),
             "calls": sorted(set(objs("CALLS"))),
@@ -976,7 +984,11 @@ class Neo4jStore:
             "uses": sorted(set(objs("CALLS_EXTERNAL"))),
             "initializes": objs("INITIALIZES"),
             "inherits": sorted(set(objs("INHERITS_FROM"))),
-            "inherited_by": sorted({r["s"] for r in inbound if r["t"] == "INHERITS_FROM"}),
+            "inherited_by": sorted({r["sq"] or r["s"] for r in inbound
+                                    if r["t"] == "INHERITS_FROM"}),
+            "overrides": sorted(set(objs("OVERRIDES"))),
+            "overridden_by": sorted({label(r["sq"], r["sname"]) for r in inbound
+                                     if r["t"] == "OVERRIDES"}),
             "members": sorted(set(objs("HAS_METHOD") + objs("HAS_CONSTRUCTOR")
                                   + objs("HAS_FIELD"))),
             **loc,

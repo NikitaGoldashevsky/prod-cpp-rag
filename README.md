@@ -222,7 +222,8 @@ search_code(query, index="", top_k=8)  linked entities + fact cards + chunks
 get_entity(name, index="")           signature, callers, callees, throws, source,
                                      declared_in_index / first_member for classes
 get_neighbours(name, index="", hops=1) one-hop graph expansion
-find_symbol(pattern, index="", limit=50) substring or glob, ranked
+find_symbol(pattern, index="", limit=50) substring or glob, ranked;
+                                     `count` is the page, `total` the population
 read_chunk(chunk_id, index="")       one chunk by id
 reindex(name="")                     rebuild after edits (index only, never source)
 answer_question(question)            only if a model endpoint is configured
@@ -418,6 +419,28 @@ calls: guardedCall, looseCall; calls NOT inside a try block: looseCall
 
 `get_entity` exposes the same thing as `unguarded_calls`.
 
+### Virtual dispatch
+
+A call through a base pointer is statically a call to the base method, and at
+runtime it reaches the override. Both facts are recorded, so neither is hidden:
+
+```
+[FACT] Method MenuItem::execute(...); modifiers: virtual; member of MenuItem;
+       overridden by (virtual dispatch reaches these): ActiveCommand::execute,
+       ExitCommand::execute, MoveCommand::execute, ProtocolCommand::execute,
+       SendCommand::execute
+[FACT] Method ActiveCommand::execute(...); member of ActiveCommand;
+       overrides: MenuItem::execute
+```
+
+`get_entity` carries `is_virtual` in `modifiers`, plus `overrides` and
+`overridden_by`. Asking "what breaks if I change `MenuItem::execute`?" now shows
+the five implementations rather than an empty caller list.
+
+Note the limit: the `CALLS` edge still names the *static* target. A caller of
+`MenuItem::execute` through a base pointer appears under the base, not under
+each override — `overridden_by` is what tells you the set of implementations.
+
 ### The call graph, and how far to trust it
 
 `CALLS` is resolved by C++ scoping, not by name matching:
@@ -526,10 +549,11 @@ you change it, change it there too and re-run the parity check.
   most relevant chunks and their fact cards, but it is weaker than an identifier
   query.
 - **The call graph is a static, single-file-scope approximation.** It resolves
-  through declared types, not through templates, `auto`, or virtual dispatch: a
-  call through an unknown variable is reported as external rather than guessed,
-  and overrides are not linked to the base declaration. Treat `calls`/`callers`
-  as strong evidence and confirm with the source when the answer turns on it.
+  through declared types, not through templates or `auto`. A call through an
+  unknown variable is reported as external rather than guessed. Virtual
+  dispatch is *disclosed* (`overrides` / `overridden_by`) rather than
+  propagated: a `CALLS` edge names the static target, so a call through a base
+  pointer is listed under the base, not under every override.
 - **A class with a base outside the index is treated cautiously.** Inside such
   a class, a bare call is not bound to a header-declared free function of the
   same name — it may well be an inherited member we cannot see, so it is

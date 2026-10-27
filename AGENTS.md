@@ -229,6 +229,12 @@ same-file free functions), never by matching a bare method name. So:
   call it makes is guarded — say that plainly instead of hedging.
 - If `overloaded: true`, the `calls`/`callers` fields describe one overload. Read
   the `overloads` list before claiming what "calling X" does.
+- `overridden_by` lists the implementations that virtual dispatch can reach for
+  a virtual method. When asked "what breaks if I change this method", mention
+  both `callers` and `overridden_by` — an empty `callers` on a virtual method
+  does not mean nothing depends on it.
+- `find_symbol` returns `count` (this page) and `total` (all matches). Quote
+  `total` when reporting how many symbols match.
 
 If the tools do not appear: run the command by hand in a terminal. It should
 print nothing and wait for stdin. Any output before the handshake breaks the

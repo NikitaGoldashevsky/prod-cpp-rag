@@ -80,11 +80,12 @@ def main(argv) -> int:
                 continue
             checked += 1
             for key in ("fact_card", "file", "line_start", "line_end",
-                        "has_try_catch", "kind", "qname"):
+                        "has_try_catch", "kind", "qname", "modifiers",
+                        "is_definition"):
                 if a.get(key) != b.get(key):
                     diffs.append((qname, key, a.get(key), b.get(key)))
             for key in ("calls", "callers", "members", "inherits", "uses",
-                        "unguarded_calls"):
+                        "unguarded_calls", "overrides", "overridden_by"):
                 if sorted(a.get(key) or []) != sorted(b.get(key) or []):
                     diffs.append((qname, key, sorted(a.get(key) or [])[:6],
                                   sorted(b.get(key) or [])[:6]))

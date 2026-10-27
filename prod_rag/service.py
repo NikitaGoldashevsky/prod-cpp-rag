@@ -208,13 +208,24 @@ class Service:
             return {"pattern": pattern, "count": 0, "matches": [],
                     "error": "empty pattern", "hint": "pass a name or glob, e.g. 'Tcp*'"}
         hits = []
+        totals = {}
         for idx in self.pick(index):
             self._ready(idx)
-            for h in idx.find(pattern, limit=limit):
+            # Ask for the full population so `total` is honest; `count` used to
+            # be the page size, which understates any common name.
+            found = idx.find(pattern, limit=10_000)
+            totals[idx.name] = len(found)
+            for h in found[:limit]:
                 h["index"] = idx.name
                 hits.append(h)
-        return {"pattern": pattern, "count": len(hits),
-                "matches": hits[:limit * max(1, len(self.pick(index)))]}
+        total = sum(totals.values())
+        out = {"pattern": pattern, "count": len(hits), "total": total,
+               "matches": hits}
+        if total > len(hits):
+            out["truncated"] = True
+            out["hint"] = (f"{total} matches, showing the first {len(hits)}; "
+                           f"raise `limit` or use a narrower pattern")
+        return out
 
     def chunk(self, chunk_id: str, index: str | None = None) -> dict:
         """Read one chunk. Accepts `index::chunk-id` or a bare chunk id."""
