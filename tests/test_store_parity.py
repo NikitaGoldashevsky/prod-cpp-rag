@@ -83,7 +83,8 @@ def main(argv) -> int:
                         "has_try_catch", "kind", "qname"):
                 if a.get(key) != b.get(key):
                     diffs.append((qname, key, a.get(key), b.get(key)))
-            for key in ("calls", "callers", "members", "inherits", "uses"):
+            for key in ("calls", "callers", "members", "inherits", "uses",
+                        "unguarded_calls"):
                 if sorted(a.get(key) or []) != sorted(b.get(key) or []):
                     diffs.append((qname, key, sorted(a.get(key) or [])[:6],
                                   sorted(b.get(key) or [])[:6]))

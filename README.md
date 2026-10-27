@@ -237,6 +237,16 @@ index store under `~/.local/share/prod-rag`.
 is labelled as such and never sorted above a real symbol. If every hit says
 `substring`, the symbol you named probably does not exist.
 
+`search_code` labels linked entities the same way: `qname` and `name` mean the
+query named the entity, `text` means it only shares words with it. A name that
+appears only inside someone else's qualifier does not count — asking about
+`TcpClient::setEnabled` links `TcpClient`, not `Logger::setEnabled`.
+
+`get_entity` on an overloaded name reports `overloaded: true` with an
+`overloads` list (id, parameters, location), because `calls`/`callers` describe
+one overload only. Pass an id from that list — bare (`Api::show#2`) or prefixed
+(`core::class:src/Api::show#2`) — to look at another.
+
 ### Wiring it into a harness
 
 Any MCP client needs the command, its arguments, and optionally `PROD_RAG_DATA`.
@@ -395,7 +405,18 @@ plus control-flow facts per callable: `has_try_catch` and `throw_sites`
 (each tagged `guarded` / `unguarded`).
 
 Exception handling is modelled as a fact, not a text match — that is what makes
-"is this call guarded?" answerable.
+"is this call guarded?" answerable. Guardedness belongs to the **call**, not the
+function: `SendCommand::execute` has a `try`, so "does it have try/catch" is the
+wrong question, and "is *this* call inside it" is the right one. Each `CALLS`
+edge carries `guarded`, and the fact card states the result either way:
+
+```
+calls: TcpClient::connect, TcpClient::disconnect, ...;
+every call above is inside the try block; has try/catch
+calls: guardedCall, looseCall; calls NOT inside a try block: looseCall
+```
+
+`get_entity` exposes the same thing as `unguarded_calls`.
 
 ### The call graph, and how far to trust it
 

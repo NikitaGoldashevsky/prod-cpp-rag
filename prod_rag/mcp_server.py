@@ -113,6 +113,11 @@ def build_server(service: Service, chat=None):
         Returns linked ontology entities (with file:line), the exact structured
         fact cards, and the best matching source chunks. This is the primary
         entry point for "where is X", "what does X do", "who calls X".
+
+        Each linked entity carries `match`: `qname` or `name` means the query
+        named it; `text` means it merely shares words with the query. Trust the
+        first two, treat `text` hits as leads. If the symbol you asked about is
+        absent entirely, it does not exist under that name in this index.
         """
         return _safe(service.search, query, index=index or None,
                      top_k=max(1, min(top_k, 30)))
@@ -132,6 +137,12 @@ def build_server(service: Service, chat=None):
         a call to a project function. For a class, `declared_in_index: false`
         means its header is outside the indexed subtree, and `first_member`
         points at real code instead of an empty line range.
+
+        If the name is overloaded the response carries `overloaded: true` and an
+        `overloads` list (id, parameters, location) — the `calls`/`callers`
+        fields then describe the one overload that was returned. Re-query with
+        an id from that list to see another. Both a bare id and an
+        `index::id` id (as printed by search_code) are accepted.
         """
         return _safe(service.entity, name, index=index or None)
 

@@ -164,8 +164,17 @@ class Service:
         return {"query": query, "indexes": results,
                 "hint": next((r["hint"] for r in results if r.get("hint")), None)}
 
+    def _unprefix(self, name: str) -> str:
+        """Accept `index::id`, the form search_code emits for ids."""
+        if "::" in name:
+            pref, rest = name.split("::", 1)
+            if pref in self.indexes:
+                return rest
+        return name
+
     def entity(self, name: str, index: str | None = None) -> dict:
         found = []
+        name = self._unprefix(name)
         for idx in self.pick(index):
             self._ready(idx)
             payload = idx.entity(name)
@@ -180,6 +189,7 @@ class Service:
 
     def neighbours(self, name: str, index: str | None = None, hops: int = 1) -> dict:
         out = []
+        name = self._unprefix(name)
         for idx in self.pick(index):
             self._ready(idx)
             r = idx.neighbours(name, hops=hops)
@@ -192,6 +202,11 @@ class Service:
         return {"found": True, "matches": out}
 
     def find(self, pattern: str, index: str | None = None, limit: int = 50) -> dict:
+        if not (pattern or "").strip():
+            # An empty pattern used to return the first N entities in the index,
+            # which looks like a real answer. Say what is wrong instead.
+            return {"pattern": pattern, "count": 0, "matches": [],
+                    "error": "empty pattern", "hint": "pass a name or glob, e.g. 'Tcp*'"}
         hits = []
         for idx in self.pick(index):
             self._ready(idx)
@@ -245,9 +260,12 @@ class Service:
                 # answer failure this backend must not have.
                 loaded._store = self._neo.for_dataset(name)
                 stats = self._neo.load_index(loaded.payload, clear=True)
+                info = self._neo.dataset_info(name) or {}
                 self._graph_cache[name] = {
                     "dataset": name, "entities": stats["entities"],
-                    "chunks": stats["chunks"], "pushed_at": None}
+                    "chunks": stats["chunks"],
+                    "pushed_at": info.get("pushed_at"),
+                    "root": info.get("root")}
                 new_meta = dict(new_meta, pushed=stats)
             self.indexes[name] = loaded
             return new_meta

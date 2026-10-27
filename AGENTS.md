@@ -181,6 +181,16 @@ Notes:
 3. `get_entity("SomeKnownName")` → returns `"found": true` with `callers`,
    `throw_sites` and `fact_card`.
 
+### Reading retrieval output honestly
+
+- `search_code` labels every linked entity with `match`: `qname`/`name` means the
+  query named it, `text` means it only shares words with it. Build an answer on
+  the first two; treat `text` hits as leads to check.
+- If the symbol you asked about is not in `linked` at all, it does not exist
+  under that name in this index — do not assume the `text` hits are it.
+- `find_symbol` labels hits `exact`/`prefix`/`word`/`substring`/`glob`. All
+  `substring` means the name you have in mind is not there.
+
 ### Reading `calls` / `callers` honestly
 
 The call graph is resolved by C++ scope (own class, bases, typed receivers,
@@ -200,6 +210,11 @@ same-file free functions), never by matching a bare method name. So:
   that is a bug worth reporting, not something to paper over.
 - A class with `declared_in_index: false` has its header outside the indexed
   subtree; use `first_member` to point at real code instead of `line_start: 0`.
+- Guardedness is per call: `unguarded_calls` lists the calls that are outside the
+  try block. If a function has a try/catch and `unguarded_calls` is empty, every
+  call it makes is guarded — say that plainly instead of hedging.
+- If `overloaded: true`, the `calls`/`callers` fields describe one overload. Read
+  the `overloads` list before claiming what "calling X" does.
 
 If the tools do not appear: run the command by hand in a terminal. It should
 print nothing and wait for stdin. Any output before the handshake breaks the

@@ -64,6 +64,54 @@ def store_kind() -> str:
     return (os.environ.get("PROD_RAG_STORE") or "memory").strip().lower()
 
 
+_QNAME_RE = re.compile(r"[A-Za-z_]\w*(?:::[A-Za-z_~]\w*)+")
+_WORD_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def link_candidates(query: str) -> list[tuple[str, str]]:
+    """Symbol-shaped things in a question, qualified references first.
+
+    `who calls TcpClient::connect` -> [('TcpClient::connect', 'qname'),
+    ('TcpClient', 'word'), ('who', 'word'), ...]. Both stores use this so a
+    query means the same thing on either backend.
+    """
+    out, seen = [], set()
+    for m in _QNAME_RE.finditer(query):
+        t = m.group(0)
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            out.append((t, "qname"))
+    for m in _WORD_RE.finditer(query):
+        t = m.group(0)
+        if len(t) < 2 or t.lower() in seen:
+            continue
+        seen.add(t.lower())
+        out.append((t, "word"))
+    return out
+
+
+def name_used_for(query_low: str, name_lc: str, owner_lc: str) -> bool:
+    """Is `name_lc` used on its own, or only as part of `SomeoneElse::name`?
+
+    Mirrors `CppOntology._names_entity`: a word that only ever appears
+    qualified by a different class does not name this entity.
+    """
+    occs = list(re.finditer(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])"
+                            % re.escape(name_lc), query_low))
+    if not occs:
+        return False
+    for m in occs:
+        before = query_low[:m.start()].rstrip()
+        if before.endswith("::") or before.endswith(".") or before.endswith("->"):
+            qual = re.search(r"([A-Za-z_]\w*)\s*$", before[:-2].rstrip())
+            q = qual.group(1).lower() if qual else ""
+            if owner_lc and q == owner_lc:
+                return True
+            continue
+        return True
+    return False
+
+
 class StoreNotReady(RuntimeError):
     """The graph cannot answer for this index (not pushed, or pushed empty).
 
@@ -116,6 +164,29 @@ def match_rank(qname: str, name: str, pattern: str) -> tuple[int, str]:
         if best is None or cand[0] < best[0]:
             best = cand
     return best or (3, "substring")
+
+
+def overload_note(qname: str, siblings: list[dict]) -> dict:
+    """Tell a caller that the name they asked about is overloaded.
+
+    `get_entity("Api::count")` returned one of two overloads with no hint that
+    the other existed, so "what breaks if I change count" was answered from
+    half the evidence. Empty dict when there is only one.
+    """
+    if len(siblings) <= 1:
+        return {}
+    return {
+        "overloaded": True,
+        "overloads": sorted(
+            ({"id": x["id"], "params": x.get("params") or [],
+              "file": x.get("file") or "", "line_start": x.get("line_start") or 0,
+              "is_definition": bool(x.get("is_definition", True))}
+             for x in siblings),
+            key=lambda x: (len(x["params"]), x["file"], x["line_start"])),
+        "hint": (f"{len(siblings)} overloads share this name; `calls`/`callers` "
+                 f"above describe one of them. Pass the id (e.g. "
+                 f"'{siblings[0]['id']}') to pick another."),
+    }
 
 
 def class_location(declared_line: int, members: list[dict]) -> dict:
@@ -191,6 +262,7 @@ class MemoryStore:
                     seen.add(eid)
                     cards.append(onto._card(onto.entities[eid]))
             facts = "\n\n".join(cards)
+        why = {d["id"]: d["match"] for d in res.get("linked_detail", [])}
         return {
             "linked": [
                 {"id": eid,
@@ -199,7 +271,8 @@ class MemoryStore:
                  "kind": onto.entities[eid].kind,
                  "file": onto.entities[eid].file,
                  "line_start": onto.entities[eid].line_start,
-                 "line_end": onto.entities[eid].line_end}
+                 "line_end": onto.entities[eid].line_end,
+                 "match": why.get(eid, "text")}
                 for eid in res["linked"] if eid in onto.entities],
             "facts": facts,
             "hint": (None if res["chunks"] else
@@ -217,6 +290,17 @@ class MemoryStore:
         onto = self.onto
         if name in onto.entities:
             return name
+        # `Api::show#2` — an overload id as printed by get_entity/search_code.
+        # Without this, the hint that says "pass the id" points at a string the
+        # very next call rejects.
+        if "#" in name:
+            base, _, nth = name.rpartition("#")
+            if nth.isdigit():
+                ids = [i for i in onto._by_qname.get(base, []) if i in onto.entities]
+                if ids:
+                    k = int(nth) - 1
+                    if 0 <= k < len(ids):
+                        return ids[k]
         low = name.lower()
         exact = [eid for eid, e in onto.entities.items()
                  if (e.qname or "").lower() == low or e.name.lower() == low]
@@ -246,7 +330,14 @@ class MemoryStore:
         e = onto.entities[eid]
         lab = lambda x: (onto.entities[x].qname if x in onto.entities else x)
         chunk = next((c for c in onto.chunks if c["id"] == eid), None)
-        loc = {}
+        sib = []
+        for other_id in onto._by_qname.get(e.qname or "", []):
+            o2 = onto.entities.get(other_id)
+            if o2 is not None:
+                sib.append({"id": other_id, "params": o2.params,
+                            "file": o2.file, "line_start": o2.line_start,
+                            "is_definition": o2.is_definition})
+        loc = overload_note(e.qname or "", sib)
         if e.kind in ("Class", "Struct"):
             kids = [onto.entities[i] for i in
                     onto._out(eid, "hasMethod") + onto._out(eid, "hasConstructor")
@@ -264,6 +355,8 @@ class MemoryStore:
                            ("virtual", e.is_virtual), ("noexcept", e.is_noexcept)) if v],
             "has_try_catch": e.has_try_catch, "throw_sites": e.throw_sites,
             "calls": sorted({lab(o) for o in onto._out(eid, "calls")}),
+            "unguarded_calls": sorted({lab(o) for o in onto._out(eid, "calls")
+                                       if onto._call_guarded(eid, o) is False}),
             "callers": sorted({lab(r.s) for r in onto.relations
                                if r.o == eid and r.p == "calls"}),
             "references": sorted({lab(o) for o in onto._out(eid, "references")}),
@@ -534,6 +627,8 @@ class Neo4jStore:
                     stats["entities"] += len(chunk)
 
             # relationships (multiset preserved via `ords`)
+            # `guarded` is part of an edge's identity: the same caller can call
+            # the same callee both inside and outside a try block.
             grouped: dict[tuple, list[int]] = {}
             for i, r in enumerate(payload["relations"]):
                 if r["p"] in LITERAL_PREDICATES:
@@ -541,16 +636,23 @@ class Neo4jStore:
                 rtype = REL_TYPES.get(r["p"])
                 if rtype is None:
                     continue
-                grouped.setdefault((rtype, r["s"], r["o"]), []).append(i)
+                grouped.setdefault((rtype, r["s"], r["o"], r.get("guarded")),
+                                   []).append(i)
             by_type: dict[str, list[dict]] = {}
-            for (rtype, subj, obj), ords in grouped.items():
-                by_type.setdefault(rtype, []).append({"s": subj, "o": obj, "ords": ords})
+            for (rtype, subj, obj, g), ords in grouped.items():
+                by_type.setdefault(rtype, []).append(
+                    {"s": subj, "o": obj, "g": g, "ords": ords})
             for rtype, rows in by_type.items():
+                # Only CALLS carries `guarded`, and Cypher refuses a null in a
+                # MERGE pattern, so the pattern differs per relationship type.
+                merge = (f"MERGE (a)-[r:{rtype} {{guarded: row.g}}]->(b) "
+                         if rtype == "CALLS" else
+                         f"MERGE (a)-[r:{rtype}]->(b) ")
                 for chunk in self._batch(rows, 5000):
                     s.run(f"UNWIND $rows AS row "
                           f"MATCH (a:Entity {{dataset: $ds, id: row.s}}) "
                           f"MATCH (b:Entity {{dataset: $ds, id: row.o}}) "
-                          f"MERGE (a)-[r:{rtype}]->(b) SET r.ords = row.ords",
+                          + merge + "SET r.ords = row.ords",
                           rows=chunk, ds=ds).consume()
                     stats["relations"] += sum(len(r["ords"]) for r in chunk)
 
@@ -648,15 +750,66 @@ class Neo4jStore:
             s.run("MATCH (d:Dataset) DETACH DELETE d").consume()
 
     # ---- queries ---------------------------------------------------------
+    def link(self, query: str, max_hits: int = 12) -> list[dict]:
+        """Entities the query names, best first, with the reason for each hit.
+
+        Exact symbol lookup runs before full-text. Full-text alone decided that
+        `AstroTableForm::setEnable` was the best match for a question about
+        `AlarmClock::setEnabled` — a symbol that does not exist — and the
+        symbol that *was* named never made it into the context.
+        """
+        ds = self._ds()
+        found: dict[str, dict] = {}
+        low = query.lower()
+        rule = ("NOT e:Parameter AND NOT e:File AND NOT e:GlobalBlock "
+                "AND NOT e:Header ")
+        with self._session() as s:
+            for cand, kind in link_candidates(query):
+                if kind == "qname":
+                    rows = s.run(
+                        f"MATCH (e:Entity {{dataset:$ds}}) WHERE {rule} "
+                        "AND (e.qname_lc = $c OR e.id = $c) "
+                        "RETURN e.id AS id, e.kind AS kind, coalesce(e.qname,e.name) AS qname, "
+                        "e.name AS name, e.qname AS qn, e.file AS file, "
+                        "e.line_start AS ls, e.line_end AS le "
+                        "ORDER BY coalesce(e.is_definition,true) DESC LIMIT $k",
+                        ds=ds, c=cand.lower(), k=max(2, max_hits)).data()
+                    match = "qname"
+                else:
+                    rows = s.run(
+                        f"MATCH (e:Entity {{dataset:$ds}}) WHERE {rule} "
+                        "AND e.name_lc = $c "
+                        "RETURN e.id AS id, e.kind AS kind, coalesce(e.qname,e.name) AS qname, "
+                        "e.name AS name, e.qname AS qn, e.file AS file, "
+                        "e.line_start AS ls, e.line_end AS le "
+                        "ORDER BY coalesce(e.is_definition,true) DESC LIMIT $k",
+                        ds=ds, c=cand.lower(), k=max(2, max_hits)).data()
+                    match = "name"
+                for r in rows:
+                    if r["id"] in found:
+                        continue
+                    if match == "name":
+                        owner = (r["qn"] or "").split("::")[0].lower()
+                        if not name_used_for(low, (r["name"] or "").lower(), owner):
+                            continue
+                    found[r["id"]] = {"id": r["id"], "name": r["name"],
+                                      "qname": r["qname"], "kind": r["kind"],
+                                      "file": r["file"], "line_start": r["ls"],
+                                      "line_end": r["le"], "match": match}
+                    if len(found) >= max_hits:
+                        return list(found.values())
+        return list(found.values())
+
     def search(self, query: str, top_k: int = 8, hops: int = 1) -> dict:
-        """Full-text over entities and chunks, then one hop for surrounding facts."""
+        """Symbol-first linking, then full-text for the code chunks."""
         ds = self._ds()
         like = _fts_query(query)
-        linked, chunks = [], []
+        linked = self.link(query, max_hits=max(3, top_k + 3))
+        chunks = []
         with self._session() as s:
             if like:
-                # The full-text index streams in score order, so the dataset
-                # filter costs nothing extra: LIMIT stops the scan.
+                # Full-text still contributes entities the query describes but
+                # does not name ("where do we retry a failed send").
                 for rec in s.run(
                         "CALL db.index.fulltext.queryNodes('entity_text', $q) "
                         "YIELD node, score "
@@ -667,11 +820,13 @@ class Neo4jStore:
                         "node.kind AS kind, node.file AS file, node.line_start AS ls, "
                         "node.line_end AS le, score ORDER BY score DESC LIMIT $k",
                         q=like, ds=ds, k=max(3, top_k)):
-                    if rec["id"] not in {x["id"] for x in linked}:
-                        linked.append({"id": rec["id"], "name": rec["name"],
-                                       "qname": rec["qname"] or rec["name"],
-                                       "kind": rec["kind"], "file": rec["file"],
-                                       "line_start": rec["ls"], "line_end": rec["le"]})
+                    if rec["id"] in {x["id"] for x in linked}:
+                        continue
+                    linked.append({"id": rec["id"], "name": rec["name"],
+                                   "qname": rec["qname"] or rec["name"],
+                                   "kind": rec["kind"], "file": rec["file"],
+                                   "line_start": rec["ls"], "line_end": rec["le"],
+                                   "match": "text"})
                 for rec in s.run(
                         "CALL db.index.fulltext.queryNodes('chunk_text', $q) "
                         "YIELD node, score "
@@ -729,6 +884,11 @@ class Neo4jStore:
 
     def entity(self, name: str) -> dict | None:
         ds = self._ds()
+        nth = None
+        if "#" in name:
+            base, _, num = name.rpartition("#")
+            if num.isdigit():
+                name, nth = base, int(num) - 1
         with self._session() as s:
             rec = s.run(
                 "MATCH (e:Entity {dataset:$ds}) "
@@ -751,6 +911,20 @@ class Neo4jStore:
                 return None
             node = dict(rec["e"])
             eid = node["id"]
+            sib_rows = s.run(
+                "MATCH (e:Entity {dataset:$ds}) WHERE e.qname = $q "
+                "RETURN e.id AS id, e.params_json AS pj, e.file AS file, "
+                "e.line_start AS ls, coalesce(e.is_definition,true) AS def "
+                "ORDER BY e.id", ds=ds, q=node.get("qname") or "").data()
+            if nth is not None and sib_rows:
+                k = min(max(nth, 0), len(sib_rows) - 1)
+                if sib_rows[k]["id"] != eid:
+                    rec2 = s.run(
+                        "MATCH (e:Entity {dataset:$ds, id:$id}) RETURN e",
+                        ds=ds, id=sib_rows[k]["id"]).single()
+                    if rec2 is not None:
+                        node = dict(rec2["e"])
+                        eid = node["id"]
             rel = s.run(
                 "MATCH (a:Entity {dataset:$ds, id:$id})-[r]->(b) "
                 "RETURN type(r) AS t, b.id AS o, b.qname AS oq, b.name AS oname, "
@@ -766,7 +940,10 @@ class Neo4jStore:
         label = lambda q, nm: q or nm
         def objs(t):
             return [label(r["oq"], r["oname"]) for r in rel if r["t"] == t]
-        loc = {}
+        loc = overload_note(node.get("qname") or "", [
+            {"id": r["id"], "params": json.loads(r["pj"] or "[]"),
+             "file": r["file"], "line_start": r["ls"],
+             "is_definition": bool(r["def"])} for r in sib_rows])
         if node.get("kind") in ("Class", "Struct"):
             kids = [{"qname": label(r["oq"], r["oname"]), "file": r["of"],
                      "line_start": r["ol"]}
@@ -790,6 +967,9 @@ class Neo4jStore:
             "has_try_catch": bool(node.get("has_try_catch", False)),
             "throw_sites": json.loads(node.get("throw_json") or "[]"),
             "calls": sorted(set(objs("CALLS"))),
+            "unguarded_calls": sorted({label(r["oq"], r["oname"]) for r in rel
+                                       if r["t"] == "CALLS"
+                                       and r.get("guarded") is False}),
             "callers": sorted({label(r["sq"], r["sname"]) for r in inbound
                                if r["t"] == "CALLS"}),
             "references": sorted(set(objs("REFERENCES"))),

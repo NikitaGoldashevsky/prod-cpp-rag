@@ -121,6 +121,15 @@ void Remote::run() {
 
 void Form::show(int mode) { show(); }   // calls the OTHER overload
 void Form::open() {}
+
+// One function, two call sites, only one of them guarded. "This function has a
+// try/catch" does not answer "is THIS call guarded".
+void guardedDelta() {}
+void looseDelta() {}
+void mixed() {
+    try { guardedDelta(); } catch (...) {}
+    looseDelta();
+}
 """
 
 # An include-guarded header: everything inside `#ifndef`. Before the fix the
@@ -227,6 +236,32 @@ def build(tmp: str):
     return idx_mod.load("cg").onto
 
 
+def check_overload_order(tmp: str) -> bool:
+    """Same overloads, but the header sorts *before* the .cpp.
+
+    This ordering used to delete an overload outright: the definition of
+    `s(int)` collided with the id of `s()`, the twin merge kept the definition
+    but wrote it under the colliding id, and `s()` ceased to exist.
+    """
+    root = os.path.join(tmp, "order")
+    os.makedirs(root)
+    hdr = ("#ifndef H\n#define H\nclass A { public: void s(); void s(int); };\n#endif\n")
+    src = "void A::s() {}\nvoid A::s(int) {}\n"
+    with open(os.path.join(root, "a.h"), "w") as f:
+        f.write(hdr)
+    with open(os.path.join(root, "b.cpp"), "w") as f:
+        f.write(src)
+    idx_mod.build("order", root, verbose=False)
+    onto = idx_mod.load("order").onto
+    sigs = sorted(tuple(p["type"] for p in e.params) for e in onto.entities.values()
+                  if (e.qname or "") == "A::s")
+    if sigs != [(), ("int",)]:
+        print(f"  FAIL  overloads lost when the header sorts first: {sigs}")
+        return False
+    print("  OK    both overloads survive either file order")
+    return True
+
+
 def run(tmp: str) -> int:
     onto = build(tmp)
     load = store_mod.MemoryStore(onto)
@@ -330,6 +365,26 @@ def run(tmp: str) -> int:
     else:
         print(f"  OK    include stub not returned as a symbol ({stub and stub.get('kind')})")
 
+    # ---- per-call guardedness -------------------------------------------
+    # The canonical question "who calls X and is it guarded" was answerable
+    # only from `has_try_catch`, which is a property of the *function*.
+    mixed = load.entity("mixed")
+    if not mixed:
+        print("  FAIL  mixed(): entity missing")
+        ok = False
+    else:
+        loose = mixed.get("unguarded_calls") or []
+        if loose != ["looseDelta"]:
+            print(f"  FAIL  unguarded_calls = {loose}, expected ['looseDelta']")
+            ok = False
+        else:
+            print("  OK    per-call guardedness: guardedDelta guarded, "
+                  "looseDelta not")
+        card = mixed.get("fact_card") or ""
+        if "NOT inside a try block" not in card:
+            print(f"  FAIL  fact card does not say which call is unguarded: {card}")
+            ok = False
+
     # every call edge must point at a real entity id
     for rel in onto.relations:
         if rel.p in ("calls", "references") and not rel.literal:
@@ -352,6 +407,9 @@ def run(tmp: str) -> int:
     if e.get("declared_in_index") is not False or not e.get("first_member"):
         print("  FAIL  a class defined outside the tree must say so and point "
               "at a member definition")
+        ok = False
+
+    if not check_overload_order(tmp):
         ok = False
 
     print("\nCALL GRAPH:", "PASS" if ok else "FAIL")

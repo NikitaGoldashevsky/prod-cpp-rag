@@ -378,6 +378,7 @@ class LoadedIndex:
             onto.relations = [oc.Relation(**r) for r in self.payload["relations"]]
             onto.chunks = self.payload["chunks"]
             onto.files = sorted({e.file for e in onto.entities.values() if e.file})
+            onto.index_names()       # the JSON payload has no name index
             if self._store is None or getattr(self._store, "name", "") != "neo4j":
                 onto.build_retriever()
             self._onto = onto

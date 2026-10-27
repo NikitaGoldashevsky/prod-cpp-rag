@@ -156,6 +156,10 @@ class Relation:
     p: str
     o: str
     literal: bool = False
+    # For `calls`: was the call site inside a try block? None = not recorded.
+    # An agent asked "is this call guarded?" could previously only see that the
+    # *function* has a try/catch somewhere, which is not the same claim.
+    guarded: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +184,7 @@ class CppOntology:
         self._known_classes: set[str] = set()      # prescan: class/struct names
         self._known_namespaces: set[str] = set()   # prescan: namespace names
         self._out_index: dict | None = None
+        self._guard_index: dict | None = None
         self._adj: tuple | None = None
         # (caller_id, callee_text, n_args). The callee keeps its receiver
         # (`res.append`, not `append`) — dropping it is what let a QString
@@ -352,7 +357,31 @@ class CppOntology:
             existing = self.entities[ent.id]
             merged = self._merge_dup(existing, ent)
             if merged is not None:
-                self.entities[existing.id] = merged
+                self.entities[merged.id] = merged
+                if merged.id != existing.id:
+                    self._drop(existing.id)
+                return
+            # The id is taken by a *different* overload, so this one may still
+            # be the declaration of a definition that already took a `#2` id
+            # (files are processed in path order, not declaration order).
+            twin_id = self._twin_of(ent)
+            if twin_id is not None:
+                twin = self.entities[twin_id]
+                keep = self._merge_dup(twin, ent) or twin
+                if keep is ent:
+                    # The newer entity wins, but its id currently belongs to a
+                    # *different* overload. Writing it under that id deleted
+                    # that overload — `void s(); void s(int);` in a header lost
+                    # `s()` entirely when the definitions arrived. Take the
+                    # twin's id instead.
+                    ent.id = twin_id
+                    self._drop(twin_id)
+                self.entities[keep.id] = keep
+                if keep is ent:
+                    if ent.name:
+                        self._by_name.setdefault(ent.name, ent.id)
+                    if ent.qname:
+                        self._by_qname.setdefault(ent.qname, []).append(ent.id)
                 return
             ent.id = self._unique_id(ent.id)
         self.entities[ent.id] = ent
@@ -363,7 +392,14 @@ class CppOntology:
 
     def _merge_dup(self, existing: Entity, ent: Entity):
         """Return the entity to keep when `ent` collides with `existing` at the
-        same id, or None if they are genuinely distinct (overloads)."""
+        same id, or None if they are genuinely distinct (overloads).
+
+        Overloads are told apart by *signature*, not by whether they happen to
+        have a body. Two declarations in a header (`void show();` and
+        `void show(int);`) used to collapse into one entity, so the second
+        overload disappeared from the graph entirely — and `find_symbol`,
+        `get_entity` and the call graph could then never mention it.
+        """
         if existing.qname and ent.qname and existing.qname != ent.qname:
             return None
         if existing.kind in ("Class", "Struct") and ent.kind in ("Class", "Struct"):
@@ -372,17 +408,42 @@ class CppOntology:
             return ent if (ent.code and not existing.code) else existing
         callables = ("Method", "Function", "Constructor", "Destructor")
         if existing.kind in callables and ent.kind in callables:
-            if existing.is_definition and ent.is_definition:
-                return None                      # two real definitions -> overloads
+            if _signature(existing) != _signature(ent):
+                return None                      # different parameters -> overloads
             if ent.is_definition and not existing.is_definition:
                 return ent                       # upgrade declaration -> definition
-            if existing.is_definition and not ent.is_definition:
-                return existing                  # keep the definition
-            return existing                      # two declarations -> keep first
+            return existing                      # same signature: keep the better one
         if existing.kind == ent.kind == "Field":
             return ent if (ent.code and not existing.code) else existing
         if existing.kind == ent.kind == "Parameter":
             return existing
+        return None
+
+    def _drop(self, eid: str) -> None:
+        """Remove an entity that was absorbed by a merge, and its name index."""
+        e = self.entities.pop(eid, None)
+        if e is None:
+            return
+        if e.qname:
+            lst = self._by_qname.get(e.qname) or []
+            self._by_qname[e.qname] = [x for x in lst if x != eid]
+        if e.name and self._by_name.get(e.name) == eid:
+            self._by_name.pop(e.name, None)
+
+    def _twin_of(self, ent: Entity) -> str | None:
+        """An existing entity that is the same function as `ent` (same qname and
+        signature), so a declaration and its definition become one callable."""
+        if ent.kind not in ("Method", "Function", "Constructor", "Destructor"):
+            return None
+        for other_id in self._by_qname.get(ent.qname or "", []):
+            if other_id == ent.id:
+                continue
+            other = self.entities.get(other_id)
+            if other is None or other.kind not in (
+                    "Method", "Function", "Constructor", "Destructor"):
+                continue
+            if _signature(other) == _signature(ent):
+                return other_id
         return None
 
     def _unique_id(self, base: str) -> str:
@@ -394,9 +455,11 @@ class CppOntology:
             i += 1
         return f"{base}#{i}"
 
-    def _rel(self, s: str, p: str, o: str, literal: bool = False):
-        self.relations.append(Relation(s, p, o, literal))
+    def _rel(self, s: str, p: str, o: str, literal: bool = False,
+             guarded: bool | None = None):
+        self.relations.append(Relation(s, p, o, literal, guarded))
         self._out_index = None          # invalidate the adjacency caches
+        self._guard_index = None
         self._adj = None
 
     def _out(self, subject: str, predicate: str) -> list[str]:
@@ -692,6 +755,23 @@ class CppOntology:
             # global variable declaration -> put in global block chunk only
             pass
 
+    def index_names(self) -> None:
+        """(Re)build the name -> id indexes from `self.entities`.
+
+        `_add` maintains these while parsing, but an ontology restored from a
+        JSON index only has `entities` and `relations`. Anything that looks a
+        name up — overload siblings, call resolution — then quietly sees an
+        empty index and reports "nothing found".
+        """
+        self._by_name = {}
+        self._by_qname = {}
+        self._guard_index = None
+        for eid, e in self.entities.items():
+            if e.name:
+                self._by_name.setdefault(e.name, eid)
+            if e.qname:
+                self._by_qname.setdefault(e.qname, []).append(eid)
+
     # ---- calls / throws ---------------------------------------------------
     def _extract_calls(self, node, caller_id):
         # Local declarations give the receiver of `res.append(...)` a type.
@@ -720,7 +800,8 @@ class CppOntology:
                     continue
                 args = _child_by_field(desc, "arguments")
                 nargs = len(args.named_children) if args is not None else -1
-                self._raw_calls.append((caller_id, callee, nargs))
+                guarded = _has_ancestor(node, desc, "try_statement")
+                self._raw_calls.append((caller_id, callee, nargs, guarded))
 
     def _extract_refs(self, node, caller_id):
         """Capture `&Class::method` / qualified symbol references that are not
@@ -760,7 +841,7 @@ class CppOntology:
                "classes": classes_by_name, "fields": self._field_types()}
 
         seen_calls: set[tuple[str, str]] = set()
-        for caller, callee, nargs in self._raw_calls:
+        for caller, callee, nargs, guarded in self._raw_calls:
             local = self._resolve_call(callee, self.entities.get(caller), ctx,
                                        nargs=nargs)
             # A method that calls a *different overload of itself* resolves to
@@ -773,7 +854,7 @@ class CppOntology:
                 if me is not None and len(me.params) != nargs:
                     local = None
             if local:
-                self._rel(caller, "calls", local)
+                self._rel(caller, "calls", local, guarded=guarded)
                 seen_calls.add((caller, local))
             else:
                 self._rel(caller, "callsExternal", _external_label(callee),
@@ -836,11 +917,16 @@ class CppOntology:
                 return None          # unknown receiver: do not guess
             return None
 
-        # `Class::method` / `ns::fn` — qualified: exact match first
+        # `Class::method` / `ns::fn` — qualified: exact match first, and when
+        # the name is overloaded, the argument count decides
         if "::" in callee:
-            hit = self._pick_entity(self._by_qname.get(callee, []), caller_file)
-            if hit:
-                return hit
+            ids = self._by_qname.get(callee, [])
+            if ids:
+                if len(ids) > 1:
+                    return self._pick_overload(ids, nargs)
+                hit = self._pick_entity(ids, caller_file)
+                if hit:
+                    return hit
             owner, _, name = callee.rpartition("::")
             cls = self._class_for(owner, caller_file, ctx)
             if cls:
@@ -946,17 +1032,25 @@ class CppOntology:
         return None
 
     def _pick_overload(self, ids: list[str], nargs: int):
-        """Choose between overloads by argument count, when that is decisive."""
+        """Choose between overloads by argument count, when that is decisive.
+
+        Ties prefer a definition over a declaration, then insertion order, so
+        the choice is at least deterministic and points at real code.
+        """
         ids = [i for i in dict.fromkeys(ids) if i in self.entities]
         if not ids:
             return None
-        if len(ids) == 1 or nargs < 0:
-            return ids[0]
+        if nargs < 0:
+            return self._prefer_definition(ids)
         exact = [i for i in ids if len(self.entities[i].params) == nargs]
         if exact:
-            return exact[0]
+            return self._prefer_definition(exact)
         fits = [i for i in ids if len(self.entities[i].params) >= nargs]
-        return fits[0] if fits else ids[0]
+        return self._prefer_definition(fits or ids)
+
+    def _prefer_definition(self, ids: list[str]) -> str:
+        defs = [i for i in ids if self.entities[i].is_definition]
+        return (defs or ids)[0]
 
     # `a.b` / `a->b`; a decimal point in a number is not a separator
     _CHAIN = re.compile(r"->|\.(?![0-9])")
@@ -1132,7 +1226,7 @@ class CppOntology:
         seen = set()
         for eid in entity_ids:
             e = self.entities.get(eid)
-            if not e or eid in seen or e.kind in ("File", "GlobalBlock"):
+            if not e or eid in seen or e.kind in ("File", "GlobalBlock", "Header"):
                 continue
             seen.add(eid)
             out.append(self._card(e))
@@ -1157,6 +1251,17 @@ class CppOntology:
             inits = [self._label(o) for o in self._out(e.id, "initializes")]
             if calls:
                 bits.append("calls: " + ", ".join(sorted(set(calls))))
+                loose = ([self._label(o) for o in self._out(e.id, "calls")
+                          if self._call_guarded(e.id, o) is False]
+                         if e.has_try_catch else [])
+                if loose:
+                    bits.append("calls NOT inside a try block: "
+                                + ", ".join(sorted(set(loose))))
+                elif e.has_try_catch and calls:
+                    # Say it positively. Leaving it implicit is what made a
+                    # model hedge with "we cannot definitively state whether
+                    # this call is guarded" when the answer was known.
+                    bits.append("every call above is inside the try block")
             if refs:
                 bits.append("references: " + ", ".join(sorted(set(refs))))
             if ext:
@@ -1196,67 +1301,144 @@ class CppOntology:
             return "[FACT] " + "; ".join(bits) + "."
         return f"[FACT] {e.kind} {e.qname or e.name}."
 
+    def _call_guarded(self, caller: str, callee: str) -> bool | None:
+        """Guardedness of one call edge; None when it was never recorded.
+
+        A method can call several things and guard only some of them, so the
+        answer belongs to the edge, not to the function.
+        """
+        return self._guarded_map().get((caller, callee))
+
+    def _guarded_map(self) -> dict:
+        """(caller, callee) -> guarded, built once.
+
+        Rendering a card used to scan every relation per call edge, which is
+        O(calls x relations) — the same shape that made fact cards minutes slow
+        on a 185k-line tree before they were cached.
+        """
+        if self._guard_index is None:
+            m: dict[tuple[str, str], bool | None] = {}
+            for r in self.relations:
+                if r.p != "calls":
+                    continue
+                k = (r.s, r.o)
+                if k not in m:
+                    m[k] = r.guarded
+                elif m[k] is not None and r.guarded is not None:
+                    m[k] = m[k] and r.guarded   # one unguarded site wins
+            self._guard_index = m
+        return self._guard_index
+
     def _label(self, eid: str) -> str:
         e = self.entities.get(eid)
         return e.qname if e else eid
 
     # ---- entity linking ---------------------------------------------------
-    def link(self, query: str, threshold: float = 0.9, max_hits: int = 12) -> list[str]:
-        """Find ontology entities mentioned in a query (word-bounded exact + fuzzy)."""
+    # How an entity came to be linked, best first. The label is returned to the
+    # caller so an agent can tell "you named this" from "this shares a word".
+    LINK_MATCHES = ("qname", "name", "tokens", "phrase", "fuzzy")
+
+    def link_ranked(self, query: str, threshold: float = 0.9,
+                    max_hits: int = 12) -> list[tuple[str, str, float]]:
+        """Entities mentioned in a query, best match first.
+
+        Returns [(entity_id, match_kind, score)]. `match_kind` is one of
+        LINK_MATCHES: a full `Class::method` the query really contains, a bare
+        name, every sub-word of the name appearing, a spaced-out phrase, or a
+        fuzzy near-miss.
+
+        Ranking is by match kind before score. Without that, a question naming
+        `AlarmClock::setEnabled` (a symbol that does not exist) linked whatever
+        else fuzzy-matched `setEnabled` — five unrelated entities — and the
+        symbol that *was* named got crowded out of the context.
+        """
         q_tokens: set[str] = set()
         for w in re.findall(r"[A-Za-z_]\w*", query):
             q_tokens.update(split_identifier(w))
         q_words = {w.lower() for w in re.findall(r"[A-Za-z_]\w*", query)}
         q_low = query.lower()
-        hits: dict[str, float] = {}
+        hits: list[tuple[int, float, str]] = []
+        skip = ("File", "GlobalBlock", "Parameter", "Header")
         for eid, e in self.entities.items():
-            if e.kind in ("File", "GlobalBlock", "Parameter"):
+            if e.kind in skip:
                 continue
             name = e.name or ""
             if not name:
                 continue
             ln = len(name)
+            nm = name.lower()
             qn = (e.qname or "").lower()
-            score = 0.0
-            # 1) exact token (covers short names like run, stop)
-            if ln >= 2 and name.lower() in q_words:
-                score = 1.0 + 0.01 * ln
-            # 2) word-bounded substring of the entity name / qname
-            if ln >= 3:
-                pat = r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(name.lower())
-                if re.search(pat, q_low):
-                    score = max(score, 1.0 + 0.01 * ln)
-            # 2b) all sub-tokens of the entity name appear in the query
-            #     (links e.g. 'distanceTo' from "calculate the distance to ...")
-            if score == 0.0 and ln >= 4:
+            rank, score = None, 0.0
+            if len(qn) >= 4 and qn in q_low:
+                rank, score = 0, 4.0 + 0.01 * len(qn)
+            elif ln >= 2 and nm in q_words and self._names_entity(
+                    q_low, nm, e):
+                rank, score = 1, 3.0 + 0.01 * ln
+            elif ln >= 4 and ln > 3:
                 etoks = set(split_identifier(name))
-                if etoks and etoks <= q_tokens:
-                    score = 0.85
-            if score == 0.0 and qn and len(qn) >= 3 and qn in q_low:
-                score = 1.0 + 0.01 * len(qn)
-            # 3) fuzzy only for reasonably long identifiers
-            if score == 0.0 and ln >= 6:
+                if len(etoks) > 1 and etoks <= q_tokens:
+                    rank, score = 2, 2.0 + 0.01 * ln
+            if rank is None and ln >= 3:
+                pat = r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(nm)
+                if re.search(pat, q_low):
+                    rank, score = 3, 1.5 + 0.01 * ln
+            if rank is None and ln >= 6 and threshold <= 1.0:
                 best = 0.0
                 for w in q_words:
                     if abs(len(w) - ln) > max(2, ln // 3):
                         continue
-                    best = max(best, SequenceMatcher(None, name.lower(), w).ratio())
+                    best = max(best, SequenceMatcher(None, nm, w).ratio())
                 if best >= threshold:
-                    score = best * 0.8
-            if score > 0:
-                hits[eid] = score
-        ranked = sorted(hits.items(), key=lambda kv: -kv[1])
-        # keep the best-scoring entity per id; distinct entities that merely
-        # share a simple name (different namespaces) are kept separately
+                    rank, score = 4, best * 0.8
+            if rank is not None:
+                hits.append((rank, score, eid))
+        hits.sort(key=lambda h: (h[0], -h[1], len(self.entities[h[2]].qname or
+                                                   self.entities[h[2]].name), h[2]))
+        # Strong matches (a symbol the query actually names) are not diluted by
+        # weak ones: only fall back to phrase/fuzzy hits when the query names
+        # nothing at all.
+        strong = [h for h in hits if h[0] <= 2]
+        chosen = strong if len(strong) >= 2 else hits
         out, seen = [], set()
-        for eid, _ in ranked:
+        for rank, score, eid in chosen:
             if eid in seen:
                 continue
             seen.add(eid)
-            out.append(eid)
+            out.append((eid, self.LINK_MATCHES[rank], score))
             if len(out) >= max_hits:
                 break
         return out
+
+    def _names_entity(self, q_low: str, name_lc: str, e: Entity) -> bool:
+        """Does the query name *this* entity, or merely quote its last part?
+
+        `TcpClient::setEnabled` mentions the word `setEnabled`, but it names a
+        member of TcpClient — not `Logger::setEnabled`. Linking by bare name
+        alone put the wrong class into the context and pushed the class the
+        question was actually about out of it.
+        """
+        occs = list(re.finditer(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])"
+                                % re.escape(name_lc), q_low))
+        if not occs:
+            return False
+        owner = ""
+        if e.parent and e.parent in self.entities:
+            owner = (self.entities[e.parent].name or "").lower()
+        for m in occs:
+            before = q_low[:m.start()].rstrip()
+            if before.endswith("::") or before.endswith(".") or before.endswith("->"):
+                qual = re.search(r"([A-Za-z_]\w*)\s*$", before[:-2].rstrip())
+                qname = qual.group(1).lower() if qual else ""
+                if owner and qname == owner:
+                    return True          # `TcpClient::connect` names this member
+                continue                 # qualified with someone else's name
+            return True                  # used on its own
+        return False
+
+    def link(self, query: str, threshold: float = 0.9, max_hits: int = 12) -> list[str]:
+        """Entity ids mentioned in a query, best first (see `link_ranked`)."""
+        return [eid for eid, _kind, _score in
+                self.link_ranked(query, threshold=threshold, max_hits=max_hits)]
 
     def neighbour_ids(self, entity_ids: list[str], hops: int = 1) -> list[str]:
         result = list(entity_ids)
@@ -1297,7 +1479,8 @@ class CppOntology:
     def retrieve(self, query: str, top_k: int = 5, hops: int = 1):
         """Ontology-primary retrieval: link entities, expand neighbourhood,
         then fill remaining budget with lexical code chunks."""
-        linked = self.link(query)
+        ranked = self.link_ranked(query)
+        linked = [eid for eid, _m, _s in ranked]
         expanded = self.neighbour_ids(linked, hops=hops)
         facts = self.fact_cards(expanded)
 
@@ -1318,7 +1501,9 @@ class CppOntology:
                     if ch["id"] == eid and ch["id"] not in used:
                         used.add(ch["id"])
                         chunks.append((ch, 0.0))
-        return {"linked": linked, "facts": facts, "chunks": chunks}
+        return {"linked": linked, "facts": facts, "chunks": chunks,
+                "linked_detail": [{"id": eid, "match": m, "score": round(sc, 3)}
+                                  for eid, m, sc in ranked]}
 
     def format_context(self, res, max_chars: int | None = None) -> str:
         """Render a retrieval result as the context block handed to the LLM."""
@@ -1691,6 +1876,17 @@ def _parse_params(src: bytes, fd) -> list[dict]:
             typ = re.sub(r"\s+", " ", typ)
             params.append({"name": name, "type": typ or txt, "code": txt})
     return params
+
+
+def _signature(ent) -> tuple:
+    """Identity of an overload: parameter types plus const-ness.
+
+    `show()` and `show(int)` differ here; `show(int)` declared and `show(int)`
+    defined do not. Parameter *names* are deliberately ignored.
+    """
+    return (tuple(_normalize_type(p.get("type") or "") or (p.get("type") or "").strip()
+                  for p in (ent.params or [])),
+            bool(getattr(ent, "is_const", False)))
 
 
 def _strip_template_args(text: str) -> str:
