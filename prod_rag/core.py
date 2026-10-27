@@ -495,7 +495,8 @@ class CppOntology:
             return ent if (ent.code and not existing.code) else existing
         callables = ("Method", "Function", "Constructor", "Destructor")
         if existing.kind in callables and ent.kind in callables:
-            if _signature(existing) != _signature(ent):
+            if _signature(existing, self._known_namespaces) != \
+                    _signature(ent, self._known_namespaces):
                 return None                      # different parameters -> overloads
             # Keep whichever has a body, but the declaration is where
             # `virtual`, `static`, `const` and the access specifier usually
@@ -537,7 +538,8 @@ class CppOntology:
             if other is None or other.kind not in (
                     "Method", "Function", "Constructor", "Destructor"):
                 continue
-            if _signature(other) == _signature(ent):
+            if _signature(other, self._known_namespaces) == \
+                    _signature(ent, self._known_namespaces):
                 return other_id
         return None
 
@@ -876,7 +878,11 @@ class CppOntology:
                 parent_id = cid
         ret = _declarator_return_type(self.src_bytes, node, fd)
         params = _parse_params(self.src_bytes, fd)
-        is_ctor = bool(scope) and name == scope and not in_namespace
+        # Compare against the LAST segment of the scope: for a nested class the
+        # scope is `Form::Overlay`, so `name == scope` was False and every
+        # out-of-line nested constructor was typed `Method`.
+        is_ctor = (bool(scope) and not in_namespace
+                   and name == scope.rsplit("::", 1)[-1])
         is_dtor = name.startswith("~")
         kind = "Constructor" if is_ctor else ("Destructor" if is_dtor else
                                               ("Method" if scope and not in_namespace else "Function"))
@@ -1344,7 +1350,9 @@ class CppOntology:
             # Overloads share a qname and must stay separate — the signature is
             # part of the identity. Without it this pass merged every overload
             # that happened to live in one file.
-            key = (e.kind, e.qname, _signature(e) if e.kind in callables else None)
+            key = (e.kind, e.qname,
+                   _signature(e, self._known_namespaces) if e.kind in callables
+                   else None)
             groups.setdefault(key, []).append(eid)
 
         remap: dict[str, str] = {}
@@ -1478,7 +1486,8 @@ class CppOntology:
                                     ae = self.entities.get(aid)
                                     if ae is None or not ae.is_virtual:
                                         continue
-                                    if _signature(ae) == _signature(de):
+                                    if _signature(ae, self._known_namespaces) == \
+                                            _signature(de, self._known_namespaces):
                                         de.is_virtual = True
                                         changed = True
                                         break
@@ -1508,7 +1517,8 @@ class CppOntology:
                                 ae = self.entities.get(aid)
                                 if ae is None or ae.id == de.id:
                                     continue
-                                if _signature(ae) != _signature(de):
+                                if _signature(ae, self._known_namespaces) != \
+                                        _signature(de, self._known_namespaces):
                                     continue
                                 # an override needs a virtual on one side
                                 if ae.is_virtual or de.is_virtual:
@@ -2490,6 +2500,35 @@ def _absorb(keep, other) -> None:
 _SIG_NOISE = re.compile(r"\b(const|volatile|register)\b")
 
 
+def _strip_owner(type_text: str, owner: str, known_ns) -> str:
+    """Drop qualifiers that C++ would resolve anyway.
+
+    A declaration may write a nested type as `Type` and its definition as
+    `ExportForm::Type`; the same goes for a namespace (`NavEvent` vs
+    `nv::NavEvent`). Both spellings name one type, but comparing them as strings
+    made them look like two overloads — 9 of 30 sampled entries on a real tree
+    were that false positive.
+
+    Only qualifiers that are *known* are stripped: the enclosing class, or a
+    namespace present in the corpus. An unknown qualifier is left alone, because
+    two different classes can each define a `Type`.
+    """
+    t = (type_text or "").strip()
+    changed = True
+    while changed and "::" in t:
+        changed = False
+        head, _, rest = t.partition("::")
+        if not rest:
+            break
+        if owner and head == owner:
+            t = rest
+            changed = True
+        elif head in known_ns:
+            t = rest
+            changed = True
+    return t
+
+
 def _sig_type(text: str) -> str:
     """A parameter type reduced to its overload-distinguishing form.
 
@@ -2504,13 +2543,19 @@ def _sig_type(text: str) -> str:
     return t.replace("*const", "*")
 
 
-def _signature(ent) -> tuple:
+def _signature(ent, known_ns=None) -> tuple:
     """Identity of an overload: parameter types plus const-ness.
 
     `show()` and `show(int)` differ here; `show(int)` declared and `show(int)`
-    defined do not. Parameter *names* are deliberately ignored.
+    defined do not. Parameter *names* are deliberately ignored, and a type
+    qualified by the enclosing class or a known namespace compares equal to its
+    unqualified spelling (`ExportForm::Type` == `Type`).
     """
-    return (tuple(_sig_type(p.get("type") or "") for p in (ent.params or [])),
+    qn = getattr(ent, "qname", "") or ""
+    owner = qn.rsplit("::", 1)[0].rsplit("::", 1)[-1] if "::" in qn else ""
+    ns = known_ns or frozenset()
+    return (tuple(_sig_type(_strip_owner(p.get("type") or "", owner, ns))
+                  for p in (ent.params or [])),
             bool(getattr(ent, "is_const", False)))
 
 

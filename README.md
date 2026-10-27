@@ -254,6 +254,13 @@ constructors appear there once. Signatures are compared, not entity counts: a
 declaration and its definition are one member, not an overload. Constructors
 count the same as methods.
 
+Parameter types are compared after dropping qualifiers C++ would resolve
+anyway — the enclosing class (`Type` vs `ExportForm::Type`) and namespaces
+present in the corpus (`NavEvent` vs `nv::NavEvent`). Without that, a method
+declared in a header and defined in a source file looked like two overloads:
+9 of 30 sampled entries on a real tree were that false positive. An *unknown*
+qualifier is left alone, so `take(nv::E)` and `take(Other::E)` stay distinct.
+
 When two Class entities answer to one name — a class declared in two headers
 with no `#include` between them, so the include graph cannot join them —
 the payload says so in `same_name_entities` (id, file, line, member count) with

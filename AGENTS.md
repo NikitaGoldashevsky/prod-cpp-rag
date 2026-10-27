@@ -247,7 +247,9 @@ same-file free functions), never by matching a bare method name. So:
   safe to ask for.
 - `overloaded_members` marks class members with more than one signature;
   `members` lists each name once. A declaration and its definition are one
-  member, so they are not reported as an overload.
+  member, so they are not reported as an overload, and a parameter type
+  qualified by the enclosing class or a known namespace compares equal to its
+  bare spelling.
 - `same_name_entities` means several Class nodes answer to this name and the
   `members` you are reading may be partial — check the sibling before saying a
   member is absent.

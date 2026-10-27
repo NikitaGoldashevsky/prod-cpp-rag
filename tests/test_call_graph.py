@@ -618,6 +618,109 @@ def check_lookup(tmp: str) -> bool:
     return ok
 
 
+QUAL_SRC = r"""
+#ifndef QUAL_H
+#define QUAL_H
+namespace nv { struct NavEvent { int x; }; }
+struct Other { struct Ev { int y; }; };
+class QualForm {
+public:
+    enum Type { A, B };
+    void show(Type t);
+    void go(nv::NavEvent e);
+    void pick(int a);
+    void pick(int a, int b);
+    void take(nv::NavEvent a);
+    void take(Other::Ev a);
+};
+#endif
+"""
+
+QUAL_CPP = r"""
+#include "qual.h"
+void QualForm::show(QualForm::Type t) {}
+void QualForm::go(NavEvent e) {}
+void QualForm::pick(int a) {}
+void QualForm::pick(int a, int b) {}
+void QualForm::take(nv::NavEvent a) {}
+void QualForm::take(Other::Ev a) {}
+"""
+
+
+def check_qualification_overloads(tmp: str) -> bool:
+    """A type written qualified on one side and bare on the other is one type.
+
+    `void show(Type)` declared and `void show(QualForm::Type)` defined are the
+    same method; `void go(nv::NavEvent)` and `void go(NavEvent)` likewise. Both
+    used to count as two signatures, so a plain method was reported as
+    overloaded — 9 of 30 sampled entries on a real tree.
+    """
+    root = os.path.join(tmp, "qual")
+    os.makedirs(root)
+    with open(os.path.join(root, "qual.h"), "w") as f:
+        f.write(QUAL_SRC)
+    with open(os.path.join(root, "qual.cpp"), "w") as f:
+        f.write(QUAL_CPP)
+    idx_mod.build("qual", root, verbose=False)
+    onto = idx_mod.load("qual").onto
+    from prod_rag.store import MemoryStore as _MS
+    st = _MS(onto)
+    e = st.entity("QualForm")
+    over = (e or {}).get("overloaded_members") or {}
+    ok = True
+    if "show" in over:
+        print(f"  FAIL  qualification-only difference reported as an overload: {over}")
+        ok = False
+    if "go" in over:
+        print(f"  FAIL  namespace-only difference reported as an overload: {over}")
+        ok = False
+    if over.get("pick") != 2:
+        print(f"  FAIL  a real arity overload was lost: {over}")
+        ok = False
+    if over.get("take") != 2:
+        print(f"  FAIL  two genuinely different nested types merged: {over}")
+        ok = False
+    # the decl/def pair must have merged into one entity each
+    shows = [x for x in onto.entities.values() if (x.qname or "") == "QualForm::show"]
+    if len(shows) != 1:
+        print(f"  FAIL  show() decl/def did not merge: {len(shows)} entities")
+        ok = False
+    if ok:
+        print("  OK    qualification-only differences merge; real overloads stay")
+    return ok
+
+
+def check_nested_def_ctor(tmp: str) -> bool:
+    """A nested class constructor defined out of line is a Constructor."""
+    root = os.path.join(tmp, "ndef")
+    os.makedirs(root)
+    with open(os.path.join(root, "n.h"), "w") as f:
+        f.write("#ifndef N_H\n#define N_H\nclass Form { public:\n"
+                "  class Overlay { public: Overlay(Form* f); Overlay(); ~Overlay(); };\n"
+                "};\n#endif\n")
+    with open(os.path.join(root, "n.cpp"), "w") as f:
+        f.write('#include "n.h"\nForm::Overlay::Overlay(Form* f) {}\n'
+                'Form::Overlay::Overlay() {}\nForm::Overlay::~Overlay() {}\n')
+    idx_mod.build("ndef", root, verbose=False)
+    onto = idx_mod.load("ndef").onto
+    ctors = [e for e in onto.entities.values()
+             if (e.qname or "") == "Form::Overlay::Overlay"]
+    dtors = [e for e in onto.entities.values()
+             if (e.qname or "") == "Form::Overlay::~Overlay"]
+    ok = True
+    if len(ctors) != 2 or any(e.kind != "Constructor" for e in ctors):
+        print(f"  FAIL  out-of-line nested ctors typed "
+              f"{[(e.kind, len(e.params)) for e in ctors]}")
+        ok = False
+    if not dtors or any(e.kind != "Destructor" for e in dtors):
+        print(f"  FAIL  out-of-line nested dtor typed "
+              f"{[e.kind for e in dtors]}")
+        ok = False
+    if ok:
+        print("  OK    out-of-line nested ctor/dtor keep their kind")
+    return ok
+
+
 def check_duplicate_class(tmp: str) -> bool:
     """Two Class entities for one name must be disclosed, not hidden."""
     root = os.path.join(tmp, "dup")
@@ -995,6 +1098,10 @@ def run(tmp: str) -> int:
     if not check_lookup(tmp):
         ok = False
     if not check_duplicate_class(tmp):
+        ok = False
+    if not check_qualification_overloads(tmp):
+        ok = False
+    if not check_nested_def_ctor(tmp):
         ok = False
     if not check_nested_ctor_kind(tmp):
         ok = False
