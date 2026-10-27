@@ -402,9 +402,12 @@ Exception handling is modelled as a fact, not a text match — that is what make
 `CALLS` is resolved by C++ scoping, not by name matching:
 
 1. the caller's own class, then its bases (`SingleTimer::toLable` calling
-   `deltaTime()` finds `AlarmClock::deltaTime`);
-2. a receiver with a known type — a parameter, a local (`QString res;`), or a
-   field of the caller or a base (`client_.connect()` → `TcpClient::connect`);
+   `deltaTime()` finds the base that declares it);
+2. a receiver with a known type — a parameter, a local (`QString res;`), a field
+   of the caller or a base (`client_.connect()` → `TcpClient::connect`), a
+   pointer field (`ptr_->run()`), an index into a container
+   (`clocks[i]->working()` uses the element type of `QList<NotifyClocks*>`), or
+   a chain of fields (`a.b.c()`);
 3. a free function in the same file, then the same directory;
 4. a free function that is unambiguous in the whole corpus;
 5. `Type(args)` → that type's constructor.
@@ -413,26 +416,53 @@ Anything else becomes `CALLS_EXTERNAL` with the **receiver kept** (`res.append`,
 `ip_.c_str`, `::connect`), which is the honest answer: the callee is outside the
 indexed tree or its receiver type is unknown. An unknown receiver is never
 guessed — that guess is what made a `QString::append` call look like
-`TextForm::append`.
+`TextForm::append`. A call on a temporary is reduced to a plain method name
+instead of being stored as multi-line expression text.
 
-Two consequences worth knowing:
+Three more things that would otherwise lie:
 
-- A call through a **container or smart pointer** (`vector_.size()`) lands in
-  `CALLS_EXTERNAL`: the receiver type is `std::vector`, not the element type.
 - A leading `::` means global scope, so `::connect(...)` inside
   `TcpClient::connect` is the libc call and produces no self-edge.
+- A call from one overload to another (`Form::show(int)` calling `show()`) is
+  not emitted as recursion when the arity cannot match the caller; the callee is
+  reported as external, because the overload it means is not in the index.
+- A call through a library wrapper (`std::vector::size`) stays external: the
+  receiver is the wrapper, not the element. Containers of *project* types do
+  resolve, via the element type.
 
-Measured on a generated 200-caller corpus built to reproduce the reported
-failures (same-named methods in every class, inheritance chains, member calls
-through locals and fields, explicit `::` calls): precision **0.857 → 1.000**,
-recall **0.750 → 1.000**. On `cct-app` the edges that changed were exactly the
-bad ones: `Server::handleClient → Vector3::toString` (a name collision) is gone,
-`config::loadFromJson → DeviceState` is now `DeviceState::DeviceState`, and
-`Server::handleClient → Vector3::distanceTo` now appears.
+### What the parser has to see
+
+A class is only a class if its declaration is parsed, and that was the deepest
+bug we hit: only the *direct children* of the syntax tree were visited. A header
+with an `#ifndef` include guard puts **everything** inside one `preproc_ifdef`
+node, so every class in it existed only as a body-less stub — `line_start: 0`,
+no base classes, and **no fields**, which in turn made every `obj.method()` call
+in the project unresolvable. Templates (`template <typename T> class Box`),
+namespaces and `extern "C"` blocks were lost the same way.
+
+The parser now recurses through include guards, `#if` conditionals, namespaces,
+`extern "C"` blocks and template wrappers, and handles `typedef struct {...} X;`.
+Effect on `cct-app`: free functions found 24 → 30, global-block noise 48 → 28.
+
+Measured, before → after:
+
+- **Qt-shaped corpus** (guarded headers, namespaces, pointer and container
+  receivers, one shared method vocabulary so name matching cannot be right by
+  accident): recall **0.429 → 1.000**, precision **1.000 → 1.000**.
+- **Collision corpus** (same-named methods in every class, inheritance chains,
+  explicit `::` calls): precision **0.857 → 1.000**, recall **0.750 → 1.000**.
+- **`cct-app`**: the edges that changed were the bad ones —
+  `Server::handleClient → Vector3::toString` (a name collision) gone,
+  `config::loadFromJson → DeviceState` now `DeviceState::DeviceState`, and
+  `Server::handleClient → Vector3::distanceTo` (real, through a field) present.
+- Build time did not regress: 800 files / 15.2k entities in 1.85 s, and the
+  Qt-shaped 400-file corpus builds in 0.89 s while finding 25% more entities.
 
 Classes: `get_entity` reports `declared_in_index` and, when a class is known only
 through its method definitions (its header lives outside the indexed subtree), a
-`first_member` you can jump to instead of `line_start: 0`.
+`first_member` you can jump to instead of `line_start: 0`. Entity lookup also
+refuses to answer a symbol name with an `#include` or file stub: `entity("Foo")`
+returns nothing rather than `kind: Header, file: ""`.
 
 ### Repository layout
 

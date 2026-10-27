@@ -187,7 +187,11 @@ The call graph is resolved by C++ scope (own class, bases, typed receivers,
 same-file free functions), never by matching a bare method name. So:
 
 - `calls` is trustworthy for member calls, inherited calls, calls through
-  parameters/locals/fields of known type, and `Type(args)` constructors.
+  parameters/locals/fields of known type (including pointer fields and
+  container elements, e.g. `list_[0]->run()`), and `Type(args)` constructors.
+- If a submodule looks structurally thin — classes with `line_start: 0`, empty
+  `inherits` — check whether its headers use `#ifndef` include guards. Older
+  builds lost everything inside a guard; rebuild with the current version.
 - Anything it could not resolve appears in `uses` (the `CALLS_EXTERNAL` set) with
   its receiver attached, e.g. `res.append`, `ip_.c_str`, `::connect`. That means
   "outside the indexed tree, or the receiver type is unknown" — **not** "no

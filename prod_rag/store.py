@@ -224,10 +224,17 @@ class MemoryStore:
             exact.sort(key=lambda eid: (not onto.entities[eid].is_definition,
                                         onto.entities[eid].kind in ("Parameter", "File")))
             return exact[0]
+        # Fuzzy fallback: never a file/include stub. `entity("NvDateTime")`
+        # used to resolve to the `#include "nvdatetime.h"` Header node and
+        # report `kind: Header, file: ""` -- a "found" that answers nothing.
+        stub_kinds = ("Header", "File", "GlobalBlock", "Parameter")
         sub = [eid for eid, e in onto.entities.items()
-               if low in (e.qname or e.name).lower()]
+               if low in (e.qname or e.name).lower()
+               and e.kind not in stub_kinds]
         if sub:
-            sub.sort(key=lambda eid: len(onto.entities[eid].qname or onto.entities[eid].name))
+            sub.sort(key=lambda eid: (len(onto.entities[eid].qname
+                                         or onto.entities[eid].name),
+                                      onto.entities[eid].kind != "Class"))
             return sub[0]
         return None
 
@@ -731,9 +738,13 @@ class Neo4jStore:
                 "  size(coalesce(e.qname,'')) ASC LIMIT 1",
                 n=name, lc=name.lower(), ds=ds).single()
             if not rec:
+                # Same rule as MemoryStore: an include/file stub is never a
+                # useful answer to "tell me about this symbol".
                 rec = s.run(
                     "MATCH (e:Entity {dataset:$ds}) "
-                    "WHERE e.qname_lc CONTAINS $lc OR e.name_lc CONTAINS $lc "
+                    "WHERE (e.qname_lc CONTAINS $lc OR e.name_lc CONTAINS $lc) "
+                    "AND NOT e:Header AND NOT e:File "
+                    "AND NOT e:GlobalBlock AND NOT e:Parameter "
                     "RETURN e ORDER BY size(coalesce(e.qname,'')) ASC LIMIT 1",
                     lc=name.lower(), ds=ds).single()
             if not rec:

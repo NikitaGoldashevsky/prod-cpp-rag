@@ -263,34 +263,74 @@ class CppOntology:
         self._add(file_ent)
 
         global_block_nodes: list = []
-        for node in root.children:
-            if node.type == "preproc_include":
-                self._handle_include(node)
-            elif node.type == "alias_declaration":
-                self._handle_alias(node)
-            elif node.type in ("class_specifier", "struct_specifier"):
-                self._flush_global(global_block_nodes)
-                self._handle_class(node)
-            elif node.type == "function_definition":
-                self._flush_global(global_block_nodes)
-                self._handle_function(node)
-            elif node.type == "declaration":
-                self._flush_global(global_block_nodes)
-                self._handle_top_declaration(node)
-            elif node.type == "namespace_definition":
-                # recurse one level
-                body = node.child_by_field_name("body")
-                if body:
-                    for c in body.children:
-                        if c.type == "function_definition":
-                            self._flush_global(global_block_nodes)
-                            self._handle_function(c)
-                        else:
-                            global_block_nodes.append(c)
-            else:
-                global_block_nodes.append(node)
+        self._dispatch(root.children, global_block_nodes)
         self._flush_global(global_block_nodes)
         return self
+
+    # Nodes that wrap real declarations without being one themselves.
+    _SCOPE_WRAPPERS = ("namespace_definition", "linkage_specification")
+    # Preprocessor conditionals: their contents are ordinary declarations.
+    _COND_WRAPPERS = ("preproc_ifdef", "preproc_if", "preproc_else", "preproc_elif",
+                      "preproc_elifdef")
+
+    def _dispatch(self, nodes, global_block_nodes):
+        """Handle declarations at any nesting depth.
+
+        Only looking at `root.children` silently lost whole files: a header
+        with an `#ifndef` guard wraps *everything* in a single `preproc_ifdef`
+        node, so every class in it became a body-less stub with no line numbers
+        and no base classes — and, because methods' fields were never recorded,
+        every `obj.method()` call in the project turned unresolvable. Templates
+        (`template <typename T> class Box`), `extern "C"` blocks and classes
+        inside namespaces were lost the same way.
+        """
+        for node in nodes:
+            t = node.type
+            if t == "preproc_include":
+                self._handle_include(node)
+            elif t == "alias_declaration":
+                self._handle_alias(node)
+            elif t in ("class_specifier", "struct_specifier"):
+                self._flush_global(global_block_nodes)
+                self._handle_class(node)
+            elif t == "function_definition":
+                self._flush_global(global_block_nodes)
+                self._handle_function(node)
+            elif t == "declaration":
+                self._flush_global(global_block_nodes)
+                self._handle_top_declaration(node)
+            elif t == "template_declaration":
+                # `template <...> class X {...}` / `template<...> void f(){}`
+                inner = [c for c in node.children
+                         if c.type in ("class_specifier", "struct_specifier",
+                                       "function_definition", "declaration",
+                                       "alias_declaration")]
+                if inner:
+                    self._dispatch(inner, global_block_nodes)
+                else:
+                    global_block_nodes.append(node)
+            elif t == "type_definition":
+                # `typedef struct {...} Foo;` — the struct is the entity
+                inner = [c for c in node.children
+                         if c.type in ("class_specifier", "struct_specifier",
+                                       "union_specifier", "enum_specifier")]
+                if inner:
+                    self._dispatch(inner, global_block_nodes)
+                else:
+                    global_block_nodes.append(node)
+            elif t in self._SCOPE_WRAPPERS:
+                body = node.child_by_field_name("body")
+                kids = body.children if body is not None else node.children
+                self._dispatch(kids, global_block_nodes)
+            elif t in self._COND_WRAPPERS:
+                # keep the conditional itself out of the global chunk text;
+                # its declarations are handled individually
+                kids = [c for c in node.children if not c.type.startswith("preproc")
+                        and c.type not in ("#if", "#ifdef", "#ifndef", "#else",
+                                           "#elif", "#endif", "#define")]
+                self._dispatch(kids, global_block_nodes)
+            else:
+                global_block_nodes.append(node)
 
     # ---- node handlers ----------------------------------------------------
     def _qid(self, prefix: str, name: str) -> str:
@@ -421,7 +461,11 @@ class CppOntology:
     def _flush_global(self, nodes):
         if not nodes:
             return
-        text = "\n".join(_text(self.src_bytes, n) for n in nodes)
+        # A lone `;` or `}` after a class definition is not a declaration; it
+        # used to become its own one-line "global declarations" chunk.
+        keep = [n for n in nodes
+                if re.sub(r"[\s;{}]+", "", _text(self.src_bytes, n))]
+        text = "\n".join(_text(self.src_bytes, n) for n in keep)
         if text.strip():
             base = "globals" if not self._cur_ns else f"globals:{self._cur_ns}"
             gid = self._unique_id(base)
@@ -719,11 +763,21 @@ class CppOntology:
         for caller, callee, nargs in self._raw_calls:
             local = self._resolve_call(callee, self.entities.get(caller), ctx,
                                        nargs=nargs)
+            # A method that calls a *different overload of itself* resolves to
+            # its own entity when only one overload is indexed, producing a
+            # false self-edge. If the argument count cannot be the caller's, the
+            # real target is an overload we do not have: say "external" instead
+            # of inventing recursion.
+            if local == caller and nargs >= 0:
+                me = self.entities.get(caller)
+                if me is not None and len(me.params) != nargs:
+                    local = None
             if local:
                 self._rel(caller, "calls", local)
                 seen_calls.add((caller, local))
             else:
-                self._rel(caller, "callsExternal", callee, literal=True)
+                self._rel(caller, "callsExternal", _external_label(callee),
+                          literal=True)
 
         for caller, ref in self._raw_refs:
             local = self._resolve_call(ref, self.entities.get(caller), ctx)
@@ -904,20 +958,68 @@ class CppOntology:
         fits = [i for i in ids if len(self.entities[i].params) >= nargs]
         return fits[0] if fits else ids[0]
 
+    # `a.b` / `a->b`; a decimal point in a number is not a separator
+    _CHAIN = re.compile(r"->|\.(?![0-9])")
+
     def _type_class(self, expr: str, caller, ctx: dict):
-        """The class a receiver expression has, if we can know it honestly."""
-        expr = expr.strip()
-        if expr in ("this", ""):
-            return caller.parent if caller else None
-        if expr[0] in "*&":
-            expr = expr[1:].strip()
-        cls_names = ctx["classes"]
+        """The class a receiver expression has, if we can know it honestly.
+
+        Handles the shapes C++ code actually uses for member access:
+        `obj.m()`, `ptr->m()` (pointer fields normalize to their type),
+        `container[i]->m()` / `container[i].m()` (element type of a template),
+        `this->field.m()`, and chains of fields (`a.b.c`). Anything else —
+        a call result, an arithmetic expression — returns None so the call is
+        reported as external instead of being guessed.
+        """
+        expr = (expr or "").strip()
+        if not expr:
+            return None
+        expr = expr.lstrip("*&").strip()
+        expr = expr.rstrip(")").strip()          # `foo()` used as a receiver
+        if not expr:
+            return None
+        steps = [s for s in (x.strip() for x in self._CHAIN.split(expr)) if s]
+        if not steps or len(steps) > 4:
+            return None
+
         near = caller.file if caller else None
-        if expr in cls_names:                # `Foo.bar()` / `Foo->bar()`
-            return self._class_for(expr, near, ctx)
-        tname = self._declared_type(expr, caller, ctx)
-        if tname and tname in cls_names:
-            return self._class_for(tname, near, ctx)
+        cur = None
+        for i, step in enumerate(steps):
+            m = re.match(r"^([A-Za-z_]\w*)", step)
+            if not m:
+                return None
+            name = m.group(1)
+            indexed = "[" in step
+            if name == "this":
+                cur = caller.parent if caller else None
+            elif i == 0:
+                if name in ctx["classes"]:       # `Foo.bar()` / `Foo->bar()`
+                    cur = self._class_for(name, near, ctx)
+                else:
+                    cur = self._class_of_type(
+                        self._declared_type(name, caller, ctx), near, ctx)
+            else:
+                if cur is None:
+                    return None
+                cur = self._class_of_type(
+                    ctx["fields"].get(cur, {}).get(name), near, ctx)
+            if cur is None:
+                return None
+            if indexed and i == len(steps) - 1:
+                pass                              # `arr[i]` used as a value
+        return cur
+
+    def _class_of_type(self, type_text: str | None, near: str | None, ctx: dict):
+        """Class entity for a declared type text, container element as fallback."""
+        if not type_text:
+            return None
+        names = ctx["classes"]
+        t = _normalize_type(type_text)
+        if t and t in names:
+            return self._class_for(t, near, ctx)
+        elem = _element_type(type_text)
+        if elem and elem in names:
+            return self._class_for(elem, near, ctx)
         return None
 
     def _declared_type(self, var: str, caller, ctx: dict | None = None):
@@ -926,7 +1028,7 @@ class CppOntology:
             return None
         for p in caller.params or []:
             if p.get("name") == var:
-                return _normalize_type(p.get("type") or "")
+                return (p.get("type") or "").strip()
         local = self._locals.get(caller.id, {}).get(var)
         if local:
             return local
@@ -954,7 +1056,7 @@ class CppOntology:
             f = self.entities.get(r.o)
             if f is None:
                 continue
-            out.setdefault(r.s, {})[f.name] = _normalize_type(f.type_ref or "")
+            out.setdefault(r.s, {})[f.name] = (f.type_ref or "").strip()
         return out
 
     def _caller_file(self, entity_id: str):
@@ -1600,16 +1702,58 @@ def _strip_template_args(text: str) -> str:
     if "operator" in text:
         return text
     out, depth = [], 0
+    prev = ""
     for ch in text:
-        if ch == "<":
+        if ch == "<" and depth == 0 and (prev.isalnum() or prev == "_"):
             depth += 1
+            prev = ch
             continue
-        if ch == ">":
+        # `->` is not a template close: stripping it turned `ptr->method()` into
+        # `ptr-method()`, and every call through a pointer became unresolvable.
+        if ch == ">" and depth > 0 and prev != "-":
             depth = max(0, depth - 1)
+            prev = ch
             continue
         if depth == 0:
             out.append(ch)
+        prev = ch
     return "".join(out)
+
+
+def _external_label(callee: str) -> str:
+    """A clean, single-line label for a callee we could not resolve.
+
+    `uses` is shown to humans and to models, so raw expression text with
+    embedded newlines (`QString("%1")\n   .arg(...)`) is unreadable and looks
+    like a defect. A receiver we do have (`res.append`, `ip_.c_str`) is kept:
+    that is the useful part. Anything else collapses to the method name.
+    """
+    t = " ".join((callee or "").split())
+    if not t:
+        return t
+    if "(" in t or len(t) > 60:
+        hits = list(re.finditer(r"(?:\.|->)\s*(~?[A-Za-z_]\w*)", t))
+        if hits:
+            return hits[-1].group(1)
+        m = re.match(r"^(~?[A-Za-z_]\w*)", t)
+        if m:
+            return m.group(1)
+    return t
+
+
+def _element_type(type_text: str) -> str:
+    """Element type of a container declaration.
+
+    `QList<NotifyClocks*>` -> `NotifyClocks`; `std::vector<int>` -> ``. This is
+    what makes `clocks[i]->working()` resolvable when `clocks` is a container of
+    project objects.
+    """
+    t = _TYPE_NOISE.sub(" ", type_text or "")
+    m = re.search(r"<([^<>]*)>", t)
+    if not m:
+        return ""
+    arg = m.group(1).split(",")[0]
+    return _normalize_type(arg)
 
 
 _BUILTIN_TYPES = {
