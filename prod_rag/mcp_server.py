@@ -164,6 +164,10 @@ def build_server(service: Service, chat=None):
         `pattern` is case-insensitive; `*`, `?` and `[]` are glob wildcards.
         Example: `find_symbol("Tcp*")`, `find_symbol("handle")`.
 
+        `count` is how many are in *this page*; `total` is how many match at all.
+        Quote `total` when reporting a population, and raise `limit` (max 1000)
+        to page through them.
+
         Every hit carries a `match` field: exact / prefix / word / substring /
         glob. Hits are ordered best-first, so a substring that happens to sit
         mid-word ("Tcp" inside "adjusT-Cpu") never outranks a real symbol.
@@ -171,7 +175,7 @@ def build_server(service: Service, chat=None):
         exist — check those before concluding it does.
         """
         return _safe(service.find, pattern, index=index or None,
-                     limit=max(1, min(limit, 200)))
+                     limit=max(1, min(limit, 1000)))
 
     @mcp.tool()
     def read_chunk(chunk_id: str, index: str = "") -> str:

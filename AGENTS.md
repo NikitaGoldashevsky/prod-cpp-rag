@@ -229,10 +229,15 @@ same-file free functions), never by matching a bare method name. So:
   call it makes is guarded — say that plainly instead of hedging.
 - If `overloaded: true`, the `calls`/`callers` fields describe one overload. Read
   the `overloads` list before claiming what "calling X" does.
-- `overridden_by` lists the implementations that virtual dispatch can reach for
-  a virtual method. When asked "what breaks if I change this method", mention
-  both `callers` and `overridden_by` — an empty `callers` on a virtual method
-  does not mean nothing depends on it.
+- `overridden_by` lists every implementation that virtual dispatch can reach,
+  across the whole chain, not just the direct subclass. When asked "what breaks
+  if I change this method", mention both `callers` and `overridden_by` — an
+  empty `callers` on a virtual method does not mean nothing depends on it.
+- `inherits_unknown` lists bases outside the indexed subtree. If a class has an
+  unknown base, a method it appears not to override may really be overriding an
+  inherited declaration we cannot see; say so rather than asserting it.
+- `SIGNAL()` / `SLOT()` contents are not calls. `connect(a, SIGNAL(x()), this,
+  SLOT(y()))` names handlers; it invokes nothing.
 - `find_symbol` returns `count` (this page) and `total` (all matches). Quote
   `total` when reporting how many symbols match.
 

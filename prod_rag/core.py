@@ -267,6 +267,7 @@ class CppOntology:
         self.prescan(source_text)
         self._build_one(source_text, filename or self.filename)
         self._resolve_calls_and_refs()
+        self._resolve_bases()
         self._link_overrides()
         self._finalise_chunks()
         return self
@@ -293,6 +294,7 @@ class CppOntology:
         lexical search.
         """
         self._resolve_calls_and_refs()
+        self._resolve_bases()
         self._link_overrides()
         self._finalise_chunks()
         if with_retriever:
@@ -459,6 +461,11 @@ class CppOntology:
         if existing.kind in ("Class", "Struct") and ent.kind in ("Class", "Struct"):
             if existing.name != ent.name:
                 return None
+            # keep the one with a body; a forward declaration has none
+            if ent.is_definition and not existing.is_definition:
+                return ent
+            if existing.is_definition and not ent.is_definition:
+                return existing
             return ent if (ent.code and not existing.code) else existing
         callables = ("Method", "Function", "Constructor", "Destructor")
         if existing.kind in callables and ent.kind in callables:
@@ -610,17 +617,22 @@ class CppOntology:
         nodes.clear()
 
     def _class_header_relations(self, cls_node, cls_id):
-        # inheritance
-        base = None
+        """Base classes, read from the AST.
+
+        Text + regex was wrong twice over: it matched the *template argument* of
+        `public NvStatic<ComplexTimerForm>` and recorded it as another base (a
+        class became its own base), and it produced names that were never
+        resolved to the class entities in the tree, so every inheritance edge
+        pointed at an out-of-tree stub. `_resolve_bases()` fixes the second part
+        once every file has been read.
+        """
         for c in cls_node.children:
-            if c.type == "base_class_clause":
-                base = _text(self.src_bytes, c)
-        if base:
-            for m in re.finditer(r"(?:public|private|protected)?\s*([A-Za-z_]\w*(?:::\w+)*)", base):
-                bn = m.group(1)
-                if bn in ("public", "private", "protected"):
-                    continue
-                self._rel(cls_id, "inheritsFrom", bn, literal=True)
+            if c.type != "base_class_clause":
+                continue
+            for b in c.children:
+                name = _base_type_name(self.src_bytes, b)
+                if name:
+                    self._rel(cls_id, "inheritsFrom", name, literal=True)
 
     def _handle_class(self, node):
         name_node = _child_by_field(node, "name")
@@ -946,6 +958,11 @@ class CppOntology:
                 callee = _callee_text(self.src_bytes, fn)
                 if not callee:
                     continue
+                # `connect(a, SIGNAL(pressed()), this, SLOT(onSaved()))` does not
+                # call `pressed` or `onSaved` — it names them. Recording them as
+                # calls made signal wiring look like a call graph.
+                if _inside_signal_slot_macro(self.src_bytes, desc):
+                    continue
                 args = _child_by_field(desc, "arguments")
                 nargs = len(args.named_children) if args is not None else -1
                 guarded = _has_ancestor(node, desc, "try_statement")
@@ -1196,41 +1213,125 @@ class CppOntology:
         return None
 
     # ---- resolution helpers ----------------------------------------------
-    def _link_overrides(self) -> None:
-        """Record which methods override which (virtual dispatch).
+    def _resolve_bases(self) -> None:
+        """Link each `inheritsFrom` to the class entity when it is in the tree.
 
-        A call through a base pointer lands on the base method, but at runtime
-        it reaches the derived override. Without an `overrides` edge the derived
-        method looks uncalled and the base method looks like the whole story —
-        so "what breaks if I change X" was wrong for exactly the methods this
-        codebase uses most.
+        Emits `inheritsClass` (subject -> class id) for bases that resolve. The
+        literal `inheritsFrom` name stays for out-of-tree bases, so the graph
+        still records them — but anything that walks a hierarchy (member
+        lookup, override detection) now has a real edge to follow.
         """
-        ctx = self._resolution_context()
-        members, bases, classes = ctx["members"], ctx["bases"], ctx["classes"]
+        ctx_names = {e.name: [] for e in self.entities.values()
+                     if e.kind in ("Class", "Struct")}
+        for eid, e in self.entities.items():
+            if e.kind in ("Class", "Struct"):
+                ctx_names[e.name].append(eid)
         for r in list(self.relations):
             if r.p != "inheritsFrom":
                 continue
-            derived = r.s
-            base_id = self._class_for(r.o, self.entities.get(derived, Entity(
-                id="", kind="", name="")).file if derived in self.entities else None,
-                ctx)
-            if not base_id or base_id not in self.entities:
+            subj = self.entities.get(r.s)
+            if subj is None:
                 continue
-            for name, ids in list(members.get(derived, {}).items()):
-                for did in ids:
-                    de = self.entities.get(did)
-                    if de is None:
+            cands = ctx_names.get(r.o) or []
+            cls = None
+            if len(cands) == 1:
+                cls = cands[0]
+            elif len(cands) > 1:
+                same_dir = [i for i in cands
+                            if os.path.dirname(self.entities[i].file or "")
+                            == os.path.dirname(subj.file or "")]
+                cls = same_dir[0] if len(same_dir) == 1 else None
+            if cls and cls != r.s:
+                self._rel(r.s, "inheritsClass", cls)
+
+    def _link_overrides(self) -> None:
+        """Record which methods override which, across the whole chain.
+
+        Emits `overrides` for every ancestor that declares the same signature
+        *virtually*, not just the immediate parent. A call through a base
+        pointer reaches the derived implementation at runtime, so asking "what
+        breaks if I change this virtual method" has to name every descendant
+        that implements it — and the inverse (`overridden_by`) is what a caller
+        actually reads.
+
+        `inheritsClass` is the edge that makes this work; while inheritance was
+        only a literal name, the walk stopped after one generation and the gap
+        was silent.
+        """
+        members: dict[str, dict[str, list[str]]] = {}
+        for r in self.relations:
+            if r.p in ("hasMethod", "hasConstructor", "hasField"):
+                e = self.entities.get(r.o)
+                if e is not None:
+                    members.setdefault(r.s, {}).setdefault(e.name, []).append(r.o)
+        parents: dict[str, list[str]] = {}
+        for r in self.relations:
+            if r.p == "inheritsClass" and r.o in self.entities:
+                parents.setdefault(r.s, []).append(r.o)
+
+        # A method that overrides a virtual is itself virtual, whether or not it
+        # says so. Without propagating that, the chain stopped at generation
+        # two: `B::f` had no `virtual` keyword, so `C::f` was never linked to
+        # `A::f` and the gap was silent.
+        for _ in range(8):
+            changed = False
+            for derived in parents:
+                seen: set[str] = set()
+                frontier = list(parents.get(derived, []))
+                depth = 0
+                while frontier and depth < 8:
+                    nxt = []
+                    for anc in frontier:
+                        if anc in seen or anc not in self.entities:
+                            continue
+                        seen.add(anc)
+                        for name, ids in members.get(derived, {}).items():
+                            for did in ids:
+                                de = self.entities.get(did)
+                                if de is None or de.is_virtual:
+                                    continue
+                                for aid in members.get(anc, {}).get(name, []):
+                                    ae = self.entities.get(aid)
+                                    if ae is None or not ae.is_virtual:
+                                        continue
+                                    if _signature(ae) == _signature(de):
+                                        de.is_virtual = True
+                                        changed = True
+                                        break
+                        nxt.extend(parents.get(anc, []))
+                    frontier = nxt
+                    depth += 1
+            if not changed:
+                break
+
+        for derived, _ in list(parents.items()):
+            # ancestors, breadth-first, nearest first, depth-limited
+            seen: set[str] = set()
+            frontier = list(parents.get(derived, []))
+            depth = 0
+            while frontier and depth < 8:
+                nxt = []
+                for anc in frontier:
+                    if anc in seen or anc not in self.entities:
                         continue
-                    for bid in members.get(base_id, {}).get(name, []):
-                        be = self.entities.get(bid)
-                        if be is None or be.id == de.id:
-                            continue
-                        if _signature(be) != _signature(de):
-                            continue
-                        # C++ does not require the derived declaration to
-                        # repeat `virtual`; inheriting it is enough.
-                        if be.is_virtual or de.is_virtual:
-                            self._rel(did, "overrides", be.id)
+                    seen.add(anc)
+                    for name, ids in members.get(derived, {}).items():
+                        for did in ids:
+                            de = self.entities.get(did)
+                            if de is None:
+                                continue
+                            for aid in members.get(anc, {}).get(name, []):
+                                ae = self.entities.get(aid)
+                                if ae is None or ae.id == de.id:
+                                    continue
+                                if _signature(ae) != _signature(de):
+                                    continue
+                                # an override needs a virtual on one side
+                                if ae.is_virtual or de.is_virtual:
+                                    self._rel(did, "overrides", ae.id)
+                    nxt.extend(parents.get(anc, []))
+                frontier = nxt
+                depth += 1
 
     def _resolution_context(self) -> dict:
         """Indexes `_resolve_call` needs: members, bases, classes, suffixes."""
@@ -1562,9 +1663,12 @@ class CppOntology:
             fields = [self.entities[o].name for o in self._out(e.id, "hasField")
                       if o in self.entities]
             bases = self._out(e.id, "inheritsFrom")
+            resolved = {self.entities[x].name for x in self._out(e.id, "inheritsClass")
+                        if x in self.entities}
             bits = [f"{e.kind} {e.name}"]
             if bases:
-                bits.append("inherits " + ", ".join(bases))
+                shown = [b + ("" if b in resolved else " (not in index)") for b in bases]
+                bits.append("inherits " + ", ".join(shown))
             if methods:
                 bits.append("methods: " + ", ".join(sorted(set(methods))))
             if fields:
@@ -2270,6 +2374,47 @@ def _external_label(callee: str) -> str:
     if head and head.group(1)[:1].isupper() and head.group(1) != last.group(2):
         return f"{head.group(1)}().{last.group(2)}"
     return last.group(2)
+
+
+_SIGNAL_SLOT_MACROS = {"SIGNAL", "SLOT", "Q_SIGNAL", "Q_SLOT", "SIGNALS", "SLOTS"}
+
+
+def _inside_signal_slot_macro(src: bytes, node) -> bool:
+    """True when this call sits inside `SIGNAL(...)` / `SLOT(...)`.
+
+    Qt's string-based connect takes the signal and slot as *text*; nothing is
+    invoked at that point.
+    """
+    cur = node.parent
+    while cur is not None:
+        if cur.type == "call_expression":
+            fn = cur.child_by_field_name("function")
+            if fn is not None and _text(src, fn) in _SIGNAL_SLOT_MACROS:
+                return True
+        if cur.type in ("function_definition", "class_specifier"):
+            return False
+        cur = cur.parent
+    return False
+
+
+def _base_type_name(src: bytes, node) -> str:
+    """The type named by one entry of a base-class clause.
+
+    `public Foo`, `private ns::Bar`, `public NvStatic<Baz>` -> Foo, ns::Bar,
+    NvStatic. The template argument is NOT a base class.
+    """
+    if node.type in ("access_specifier", ":", ","):
+        return ""
+    if node.type in ("type_identifier", "qualified_identifier", "identifier"):
+        return _text(src, node)
+    if node.type == "template_type":
+        for c in node.children:
+            if c.type in ("type_identifier", "qualified_identifier"):
+                return _text(src, c)
+        return ""
+    if node.type == "template_argument_list" or node.type.endswith("_list"):
+        return ""
+    return ""
 
 
 def _element_type(type_text: str) -> str:

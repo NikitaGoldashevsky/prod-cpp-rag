@@ -437,9 +437,37 @@ runtime it reaches the override. Both facts are recorded, so neither is hidden:
 `overridden_by`. Asking "what breaks if I change `MenuItem::execute`?" now shows
 the five implementations rather than an empty caller list.
 
+Both fields are **transitive**: a three-level chain `A <- B <- C` gives
+`A::f.overridden_by = [B::f, C::f]` and `C::f.overrides = [A::f, B::f]`. The
+chain needed two things that were missing: inheritance resolved to real class
+entities (`inheritsClass`, see below), and the rule that a method overriding a
+virtual is itself virtual even without the keyword.
+
 Note the limit: the `CALLS` edge still names the *static* target. A caller of
 `MenuItem::execute` through a base pointer appears under the base, not under
 each override — `overridden_by` is what tells you the set of implementations.
+
+### Inheritance is resolved, and says when it cannot be
+
+`inheritsFrom` records the base *name*, which may point outside the index.
+`inheritsClass` is the resolved edge to a class entity when the base is in the
+tree, and the payload separates them:
+
+```
+inherits:           ['NvAutoForm', 'NvStatic']
+inherits_resolved:  ['NvAutoForm']
+inherits_unknown:   ['NvStatic']          <- outside the index
+```
+
+Before this, every inheritance edge was a literal name with no resolved target,
+so the hierarchy walk stopped after one generation and second-generation
+overrides silently vanished. The fact card marks it inline: `inherits
+NvExternal (not in index)`.
+
+Two parsing bugs went with it: base classes are now read from the AST, so the
+*template argument* of `public NvStatic<ComplexTimerForm>` is no longer recorded
+as another base (a class was its own base), and a forward declaration
+(`class Foo;`) is no longer reported as `declared_in_index: true`.
 
 ### The call graph, and how far to trust it
 

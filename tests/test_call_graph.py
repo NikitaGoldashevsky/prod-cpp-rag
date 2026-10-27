@@ -296,13 +296,13 @@ public:
     static void helper();
 };
 
-class NotifyClocks : public BaseTimer
+class VirtTimer : public BaseTimer
 {
 public:
     int deltaTime();              // override, `virtual` not repeated
 };
 
-class Mgr
+class VirtMgr
 {
 public:
     void timerEvent();
@@ -319,19 +319,48 @@ static BaseTimer base_timer;      // file-scope object of an in-tree type
 
 int BaseTimer::deltaTime() { return 0; }
 void BaseTimer::helper() {}
-int NotifyClocks::deltaTime() { return 1; }
+int VirtTimer::deltaTime() { return 1; }
 
-void Mgr::timerEvent()
+void VirtMgr::timerEvent()
 {
     base_timer.deltaTime();
-    BaseTimer* p = new NotifyClocks();
+    BaseTimer* p = new VirtTimer();
     p->deltaTime();
 }
 
-void Mgr::formatting()
+void VirtMgr::formatting()
 {
     QString("%1:%2").arg(1).arg(2);
     NvDistanceFormat(3);
+}
+"""
+
+CHAIN_SRC = r"""
+class ChainBase { public: virtual void off(); };
+class ChainMid : public ChainBase { public: void off(); };
+class ChainLeaf : public ChainMid { public: void off(); };
+class ChainOut : public NvExternalBase { public: void g(); };
+
+class ComplexTimerForm : public NvAutoForm, public NvStatic<ComplexTimerForm>
+{
+public:
+    void show();
+};
+
+class TrackForm
+{
+public:
+    void setup();
+    void onSaved();
+};
+
+void ChainBase::off() {}
+void ChainMid::off() {}
+void ChainLeaf::off() {}
+void ComplexTimerForm::show() {}
+void TrackForm::setup()
+{
+    connect(saved, SIGNAL(pressed()), this, SLOT(onSaved()));
 }
 """
 
@@ -524,14 +553,14 @@ def run(tmp: str) -> int:
     # ---- a file-scope object has a type --------------------------------
     # `static BaseTimer base_timer;` spells the type in the same file; a call
     # through it was reported external with the receiver unknown.
-    expect("Mgr::timerEvent", "calls", "BaseTimer::deltaTime")
+    expect("VirtMgr::timerEvent", "calls", "BaseTimer::deltaTime")
 
     # ---- virtual dispatch is disclosed, not hidden ---------------------
     # The static call lands on BaseTimer::deltaTime; at runtime it may reach
     # NotifyClocks::deltaTime. Both facts must be visible.
     base = load.entity("BaseTimer::deltaTime")
-    derived = load.entity("NotifyClocks::deltaTime")
-    if not base or base.get("overridden_by") != ["NotifyClocks::deltaTime"]:
+    derived = load.entity("VirtTimer::deltaTime")
+    if not base or base.get("overridden_by") != ["VirtTimer::deltaTime"]:
         print(f"  FAIL  base does not list its override: {base and base.get('overridden_by')}")
         ok = False
     if not derived or derived.get("overrides") != ["BaseTimer::deltaTime"]:
@@ -558,6 +587,56 @@ def run(tmp: str) -> int:
             print(f"  FAIL  uses label missing: {label} ({why})")
             ok = False
     print("  OK    uses labels distinguish constructions from members")
+
+    # ---- third-generation override, and the point of the chain --------
+    # `Leaf : Mid : Base`, only Base says `virtual`. Each link must be visible:
+    # asking "what breaks if I change Base::off" has to name Leaf as well.
+    chain = os.path.join(tmp, "chain")
+    os.makedirs(chain)
+    with open(os.path.join(chain, "chain.cpp"), "w") as fh:
+        fh.write(CHAIN_SRC)
+    idx_mod.build("chain", chain, verbose=False)
+    from prod_rag.store import MemoryStore as _MS
+    cs = _MS(idx_mod.load("chain").onto)
+    base_off = cs.entity("ChainBase::off")
+    leaf_off = cs.entity("ChainLeaf::off")
+    if not base_off or sorted(base_off.get("overridden_by") or []) != [
+            "ChainLeaf::off", "ChainMid::off"]:
+        print(f"  FAIL  transitive overrides: base lists "
+              f"{base_off and base_off.get('overridden_by')}")
+        ok = False
+    elif not leaf_off or "ChainBase::off" not in (leaf_off.get("overrides") or []):
+        print(f"  FAIL  grandchild override not linked: {leaf_off and leaf_off.get('overrides')}")
+        ok = False
+    else:
+        print("  OK    three-generation override chain, both directions")
+
+    # ---- an out-of-tree base is disclosed, not silently unresolved ----
+    if not base_off or base_off.get("inherits_unknown"):
+        pass
+    out_cls = cs.entity("ChainOut")
+    if out_cls and out_cls.get("inherits_unknown") != ["NvExternalBase"]:
+        print(f"  FAIL  out-of-tree base not disclosed: "
+              f"{out_cls.get('inherits_resolved')} / {out_cls.get('inherits_unknown')}")
+        ok = False
+    else:
+        print("  OK    out-of-tree base disclosed in the payload")
+
+    # ---- a class is never its own base --------------------------------
+    tpl = load.entity("ComplexTimerForm")
+    if tpl and "ComplexTimerForm" in (tpl.get("inherits") or []):
+        print(f"  FAIL  template argument recorded as a base: {tpl.get('inherits')}")
+        ok = False
+    else:
+        print("  OK    template argument is not a base class")
+
+    # ---- SIGNAL()/SLOT() contents are not calls -----------------------
+    setup = load.entity("TrackForm::setup")
+    if setup and any("onSaved" in c for c in (setup.get("calls") or [])):
+        print(f"  FAIL  signal wiring recorded as a call: {setup.get('calls')}")
+        ok = False
+    else:
+        print("  OK    SIGNAL()/SLOT() contents are not calls")
 
     # ---- an overload of itself is not recursion ------------------------
     # `Form::show(int)` calls `show()`. Only one overload exists in the index,

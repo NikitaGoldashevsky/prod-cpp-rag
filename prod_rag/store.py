@@ -189,15 +189,20 @@ def overload_note(qname: str, siblings: list[dict]) -> dict:
     }
 
 
-def class_location(declared_line: int, members: list[dict]) -> dict:
+def class_location(declared_line: int, members: list[dict],
+                   is_definition: bool = True) -> dict:
     """Honest location for a class/struct.
 
     A class seen only through `Class::method` definitions has no declaration in
     the index (the header lives outside the indexed subtree). Reporting
     `line_start: 0` silently is what makes a tool look broken; instead say the
     declaration is absent and point at the first member that *is* in the tree.
+
+    A forward declaration (`class Foo;`) is a declaration but not a definition:
+    it has a line number and no body, so it must not claim to be the class's
+    home — that pointed a real call at a stray line in an unrelated header.
     """
-    if declared_line:
+    if declared_line and is_definition:
         return {"declared_in_index": True, "first_member": None}
     tops = sorted((m for m in members if m.get("line_start")),
                   key=lambda m: (m.get("file") or "", m.get("line_start") or 0))
@@ -344,7 +349,7 @@ class MemoryStore:
                     + onto._out(eid, "hasField") if i in onto.entities]
             loc = class_location(e.line_start, [
                 {"qname": k.qname or k.name, "file": k.file,
-                 "line_start": k.line_start} for k in kids])
+                 "line_start": k.line_start} for k in kids], e.is_definition)
         return {
             "id": eid, "kind": e.kind, "name": e.name, "qname": e.qname or e.name,
             "file": e.file, "line_start": e.line_start, "line_end": e.line_end,
@@ -363,6 +368,16 @@ class MemoryStore:
             "uses": sorted(set(onto._out(eid, "callsExternal"))),
             "initializes": [lab(o) for o in onto._out(eid, "initializes")],
             "inherits": onto._out(eid, "inheritsFrom"),
+            # Which bases are classes in this index, and which are outside it.
+            # `inherits` alone read as "resolved"; every edge used to be an
+            # external stub, which silently removed second-generation overrides.
+            "inherits_resolved": sorted({lab(x) for x in
+                                         onto._out(eid, "inheritsClass")}),
+            "inherits_unknown": sorted(
+                {b for b in onto._out(eid, "inheritsFrom")
+                 if b not in {onto.entities[x].name for x in
+                              onto._out(eid, "inheritsClass")
+                              if x in onto.entities}}),
             "inherited_by": [lab(r.s) for r in onto.relations
                              if r.o == eid and r.p == "inheritsFrom"],
             # Virtual dispatch: a call through a base pointer reaches these at
@@ -430,6 +445,7 @@ KIND_LABELS = ("File", "Header", "Class", "Struct", "Method", "Function",
 
 REL_TYPES = {
     "overrides": "OVERRIDES",
+    "inheritsClass": "INHERITS_CLASS",
     "includes": "INCLUDES", "declares": "DECLARES", "hasMethod": "HAS_METHOD",
     "hasConstructor": "HAS_CONSTRUCTOR", "hasField": "HAS_FIELD",
     "hasParameter": "HAS_PARAMETER", "calls": "CALLS", "references": "REFERENCES",
@@ -955,7 +971,8 @@ class Neo4jStore:
                      "line_start": r["ol"]}
                     for r in rel if r["t"] in ("HAS_METHOD", "HAS_CONSTRUCTOR",
                                                "HAS_FIELD")]
-            loc = class_location(node.get("line_start") or 0, kids)
+            loc = class_location(node.get("line_start") or 0, kids,
+                                 bool(node.get("is_definition", True)))
         return {
             "id": eid,
             "kind": node.get("kind"),
@@ -984,6 +1001,13 @@ class Neo4jStore:
             "uses": sorted(set(objs("CALLS_EXTERNAL"))),
             "initializes": objs("INITIALIZES"),
             "inherits": sorted(set(objs("INHERITS_FROM"))),
+            "inherits_resolved": sorted({label(r["oq"], r["oname"]) for r in rel
+                                         if r["t"] == "INHERITS_CLASS"}),
+            "inherits_unknown": sorted(
+                {label(r["oq"], r["oname"]) for r in rel
+                 if r["t"] == "INHERITS_FROM"}
+                - {label(r["oq"], r["oname"]) for r in rel
+                   if r["t"] == "INHERITS_CLASS"}),
             "inherited_by": sorted({r["sq"] or r["s"] for r in inbound
                                     if r["t"] == "INHERITS_FROM"}),
             "overrides": sorted(set(objs("OVERRIDES"))),
