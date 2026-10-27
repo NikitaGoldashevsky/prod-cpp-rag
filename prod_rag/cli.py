@@ -40,11 +40,18 @@ def cmd_index_add(args) -> int:
 
     if target == "neo4j":
         payload = idx_mod.load(args.name).payload
-        st = store_mod.Neo4jStore()
+        try:
+            st = store_mod.Neo4jStore()
+        except Exception as e:
+            print(f"index built, but Neo4j is not reachable: {e}\n"
+                  f"  the index is on disk; push it later with "
+                  f"`prod-rag neo4j push {args.name}`", file=sys.stderr)
+            return 1
         try:
             stats = st.load_index(payload, clear=not args.keep)
-            print(f"pushed to Neo4j: {stats['entities']} entities, "
-                  f"{stats['relations']} relations, {stats['chunks']} chunks")
+            print(f"pushed to Neo4j dataset {stats['dataset']!r}: "
+                  f"{stats['entities']} entities, {stats['relations']} relations, "
+                  f"{stats['chunks']} chunks")
         finally:
             st.close()
     return 0
@@ -107,7 +114,15 @@ def cmd_neo4j_status(args) -> int:
     try:
         st.ensure_schema()
         print(f"uri     {st.uri}")
+        ds = st.datasets()
         print("counts  " + json.dumps(st.stats()))
+        if ds:
+            _print_table([[d["dataset"], d["entities"], d["chunks"],
+                           d.get("pushed_at") or "?", d.get("root") or ""]
+                          for d in ds],
+                         ["DATASET", "ENTITIES", "CHUNKS", "PUSHED", "ROOT"])
+        else:
+            print("datasets none — push an index: prod-rag neo4j push <name>")
     finally:
         st.close()
     return 0
@@ -118,11 +133,26 @@ def cmd_neo4j_push(args) -> int:
     payload = idx_mod.load(args.name).payload
     st = store_mod.Neo4jStore()
     try:
+        if getattr(args, "reset", False):
+            st.clear_all()
+            print("graph wiped (all datasets)")
         stats = st.load_index(payload, clear=not args.keep)
         print("pushed: " + json.dumps(stats))
     finally:
         st.close()
     return 0
+
+
+def cmd_neo4j_drop(args) -> int:
+    from . import store as store_mod
+    st = store_mod.Neo4jStore()
+    try:
+        gone = st.drop_dataset(args.name)
+    finally:
+        st.close()
+    print(f"dropped {args.name!r} from the graph" if gone
+          else f"{args.name!r} was not in the graph", file=sys.stderr if not gone else sys.stdout)
+    return 0 if gone else 1
 
 
 def cmd_index_remove(args) -> int:
@@ -185,6 +215,10 @@ def cmd_doctor(args) -> int:
         print("  mcp         not installed (MCP server disabled; pip install 'mcp>=1.2')")
     kind = store_mod.store_kind()
     print(f"  store       {kind}")
+    if kind != "neo4j":
+        print("              warning: the memory backend answers from the JSON "
+              "index, not\n"
+              "              the graph. For Neo4j: export PROD_RAG_STORE=neo4j")
     if kind == "neo4j":
         try:
             neo = store_mod.Neo4jStore()
@@ -196,10 +230,30 @@ def cmd_doctor(args) -> int:
     metas = idx_mod.list_indexes()
     print(f"  data dir    {idx_mod.data_dir()}")
     print(f"  indexes     {len(metas)}")
+    graphs = {}
+    if kind == "neo4j":
+        try:
+            _neo = store_mod.Neo4jStore()
+            try:
+                graphs = {d["dataset"]: d for d in _neo.datasets()}
+            finally:
+                _neo.close()
+        except Exception:
+            graphs = {}
     for m in metas:
         idx = idx_mod.load(m["name"])
         f = idx.freshness(rescan=True)
-        print(f"    - {m['name']:<18} {f['state']:<8} {m['root']}")
+        extra = ""
+        if kind == "neo4j":
+            g = graphs.get(m["name"])
+            if not g:
+                extra = "  GRAPH: absent  -> prod-rag neo4j push " + m["name"]
+            elif g.get("entities") != (m.get("stats") or {}).get("entities"):
+                extra = (f"  GRAPH: {g.get('entities')} of "
+                         f"{(m.get('stats') or {}).get('entities')} entities (re-push)")
+            else:
+                extra = f"  GRAPH: {g.get('entities')} entities"
+        print(f"    - {m['name']:<18} {f['state']:<8} {m['root']}{extra}")
     if not metas:
         ok = False
         print("    (none — build one: prod-rag index add <name> <path>)")
@@ -270,8 +324,14 @@ def build_parser() -> argparse.ArgumentParser:
     js.set_defaults(func=cmd_neo4j_status)
     jp = jsub.add_parser("push", help="push an existing index into Neo4j")
     jp.add_argument("name")
-    jp.add_argument("--keep", action="store_true", help="do not wipe existing data")
+    jp.add_argument("--keep", action="store_true",
+                    help="merge into the dataset instead of replacing it")
+    jp.add_argument("--reset", action="store_true",
+                    help="wipe EVERY dataset in the graph first (destructive)")
     jp.set_defaults(func=cmd_neo4j_push)
+    jd = jsub.add_parser("drop", help="remove one dataset from the graph")
+    jd.add_argument("name")
+    jd.set_defaults(func=cmd_neo4j_drop)
 
     # doctor
     d = sub.add_parser("doctor", help="check the installation")

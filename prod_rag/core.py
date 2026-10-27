@@ -1408,18 +1408,29 @@ def build_from_files(paths: list[str], root: str | None = None,
     return onto.finish(with_retriever=with_retriever)
 
 
-def build_from_dir(root: str, exts=CPP_EXTS, with_retriever: bool = True) -> CppOntology:
+def build_from_dir(root: str, exts=CPP_EXTS, with_retriever: bool = True,
+                   exclude=(), skip_names=()) -> CppOntology:
     """Recursively collect C/C++ files under `root` and build one ontology.
 
     Files are namespaced by their directory relative to `root`, so the ids do
     not depend on where the project happens to live on disk.
+
+    `exclude` (directory names) and `skip_names` (file-name prefixes) keep
+    generated trees out. They exist so a caller can hand the *same* filter used
+    for freshness hashing — otherwise the graph and the hashes disagree about
+    which files exist.
     """
+    exset = set(exclude or ())
     paths = []
-    for dirpath, _dirs, files in os.walk(root):
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in exset and not d.startswith("."))
         for fn in sorted(files):
-            if fn.lower().endswith(exts):
-                rel = os.path.relpath(os.path.join(dirpath, fn), root)
-                paths.append(rel.replace("\\", "/"))
+            if not fn.lower().endswith(exts):
+                continue
+            if skip_names and fn.lower().startswith(tuple(skip_names)):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, fn), root)
+            paths.append(rel.replace("\\", "/"))
     return build_from_files(paths, root=root, with_retriever=with_retriever)
 
 

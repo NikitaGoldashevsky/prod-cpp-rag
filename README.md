@@ -124,12 +124,29 @@ prod-rag index list
 skips the Python BM25 index, since Lucene does that work). Without the flag the
 target comes from `PROD_RAG_STORE` (default `memory`).
 
+Each index occupies its own **dataset** in the graph: every entity and chunk
+carries a `dataset` property, and every query filters on it. So `core` and
+`network` can be live at the same time, and a query for one can never be
+answered out of the other.
+
+If an index exists on disk but not in the graph, the tools **refuse** rather
+than answer from whatever else is loaded:
+
+```json
+{"error": "store_not_ready",
+ "detail": "index 'core' is not in the Neo4j graph, so answering would use the
+            wrong data. Push it:  prod-rag neo4j push core\n graph holds: network"}
+```
+`list_indexes` shows the same thing up front as `store: {ready: false, hint: …}`.
+
 To push an index you already built:
 
 ```bash
-prod-rag neo4j push core          # wipes the graph first
-prod-rag neo4j push core --keep   # merge into what is there
-prod-rag neo4j status
+prod-rag neo4j push core          # replaces the 'core' dataset only
+prod-rag neo4j push core --keep   # merge into the existing 'core' dataset
+prod-rag neo4j push core --reset  # wipe EVERY dataset first (destructive)
+prod-rag neo4j drop core          # remove one dataset from the graph
+prod-rag neo4j status             # URI, counts, and the dataset table
 ```
 
 Starting small is the point: build one submodule, use it, then add more.
@@ -146,7 +163,10 @@ Options:
 - `--ext .cpp --ext .h` — restrict extensions (default: C/C++).
 - `--exclude build --exclude third_party` — extra directories to skip.
   Defaults already skip `.git`, `build`, `cmake-build-*`, `node_modules`,
-  `third_party`, `external`, `dist`, `target`, `out`, `.venv`.
+  `third_party`, `external`, `dist`, `target`, `out`, `.venv`, plus compiler
+  output (`obj`, `CMakeFiles`) and Qt-generated files (`moc_*`, `ui_*`, `qrc_*`).
+  Generated `moc_` classes shadow the real ones and make a class name resolve to
+  a body-less stub, so they are skipped even inside a directory you index.
 
 Indexes live in `~/.local/share/prod-rag/indexes/<name>/index.json`
 (override with `PROD_RAG_DATA`). They are not in this repository: they describe
@@ -201,7 +221,7 @@ index_status(name="")                per-folder hashes + changed/added/removed
 search_code(query, index="", top_k=8)  linked entities + fact cards + chunks
 get_entity(name, index="")           signature, callers, callees, throws, source
 get_neighbours(name, index="", hops=1) one-hop graph expansion
-find_symbol(pattern, index="", limit=50) substring or glob over names
+find_symbol(pattern, index="", limit=50) substring or glob, ranked
 read_chunk(chunk_id, index="")       one chunk by id
 reindex(name="")                     rebuild after edits (index only, never source)
 answer_question(question)            only if a model endpoint is configured
@@ -209,6 +229,12 @@ answer_question(question)            only if a model endpoint is configured
 
 Every tool is read-only on the filesystem except `reindex`, which writes to the
 index store under `~/.local/share/prod-rag`.
+
+`find_symbol` returns every hit with a `match` field (`exact`, `prefix`, `word`,
+`substring`, `glob`), ordered best first. Substring noise is real — the letters
+`tcp` genuinely occur inside `adjustCpu` — so a hit that only matched mid-word
+is labelled as such and never sorted above a real symbol. If every hit says
+`substring`, the symbol you named probably does not exist.
 
 ### Wiring it into a harness
 
@@ -302,8 +328,9 @@ prod-rag index add <name> <path>    build an index
 prod-rag index list                 names, roots, sizes, build times
 prod-rag index status [name]        folder hashes (+ --no-rescan for speed)
 prod-rag index remove <name>        forget an index
-prod-rag neo4j status               connection + graph counts
-prod-rag neo4j push <name>          push an existing index into Neo4j
+prod-rag neo4j status               connection, counts and the dataset table
+prod-rag neo4j push <name>          push/replace one dataset (--reset wipes all)
+prod-rag neo4j drop <name>          remove one dataset
 prod-rag search "who calls X"       facts + chunks in the terminal
 prod-rag entity TcpClient::connect  full JSON for one entity
 prod-rag serve --store neo4j        web UI
@@ -395,11 +422,17 @@ you change it, change it there too and re-run the parity check.
   link a field named `client_` before the class that actually answers the
   question. Prefer naming the symbol.
 - **Freshness is reported, not enforced.** A stale index still answers; call
-  `index_status` or `reindex`.
+  `index_status` or `reindex`. Reindexing updates the file index only — the
+  graph then lags it until `prod-rag neo4j push <name>`; `list_indexes` reports
+  that as a `store.hint`.
 - **Indexes are whole-subtree.** There is no incremental per-file update yet;
   a rebuild re-parses and re-pushes the whole indexed subtree.
-- **The Neo4j graph holds one dataset at a time.** `neo4j push` wipes the graph
-  unless `--keep`. Multi-index search is a memory-backend feature.
+- **The Neo4j graph holds several datasets, but the index loader is one graph.**
+  `neo4j push` replaces only its own dataset. The memory backend rebuilds a
+  BM25 index per index on first use; the Neo4j backend skips that entirely.
+- **Generated code is skipped, but old indexes keep it.** `moc_*`/`ui_*`/`qrc_*`
+  files and `obj/`, `CMakeFiles/` trees are excluded from new builds. Indexes
+  built before that rule need a rebuild to purge them.
 - **Parsing, not querying, is the cost at scale.** 500 files / 185k lines →
   31 s to parse and push 40k entities; queries then run in 19–169 ms.
 
@@ -432,6 +465,10 @@ the protocol).
 **Everything is stale right after building** — the tree changed between `index
 add` and `index status`, or the index root points at a parent directory that
 includes generated files. Rebuild, and add `--exclude`.
+
+**`store_not_ready` from every tool** — the index is on disk but not in the
+graph. `prod-rag neo4j push <name>`, then restart the MCP server (the dataset
+check is cached per process). `prod-rag neo4j status` lists what the graph holds.
 
 **Slow `index status` on a huge tree** — it hashes every file. Use
 `--no-rescan`, or index a smaller subtree.

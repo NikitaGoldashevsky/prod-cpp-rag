@@ -34,7 +34,8 @@ def main(argv) -> int:
     os.environ["PROD_RAG_DATA"] = tmp
     try:
         try:
-            neo = store_mod.Neo4jStore()
+            base = store_mod.Neo4jStore()
+            neo = base.for_dataset("parity")
         except Exception as e:
             print(f"skip: Neo4j not reachable ({type(e).__name__}: {e})")
             return 0
@@ -42,7 +43,7 @@ def main(argv) -> int:
         print("Store parity: memory vs Neo4j")
         meta = idx_mod.build("parity", root, verbose=False)
         payload = idx_mod.load("parity").payload
-        stats = neo.load_index(payload, clear=True)
+        stats = base.load_index(payload, clear=True)
         ok = True
 
         def fail(msg):
@@ -148,8 +149,33 @@ def main(argv) -> int:
         print(f"  OK    search returns facts + chunks on {len(QUESTIONS)} questions; "
               "symbol queries surface the symbol")
 
+        # ---- dataset isolation -------------------------------------------
+        # Two submodules in one graph must not bleed into each other, and a
+        # query for a dataset that was never pushed must refuse, not guess.
+        other = dict(payload, name="parity2")
+        base.load_index(other, clear=True)
+        try:
+            base.for_dataset("nope").assert_ready()
+            fail("querying an unpushed dataset did not raise")
+        except store_mod.StoreNotReady:
+            print("  OK    unpushed dataset refuses to answer")
+        after = neo.search("how does the client connect", top_k=3)
+        both = {d["dataset"] for d in base.datasets()}
+        if not {"parity", "parity2"} <= both:
+            fail(f"datasets in graph: {sorted(both)}")
+        elif not after["chunks"]:
+            fail("querying 'parity' broke after pushing 'parity2'")
+        else:
+            print("  OK    two datasets coexist: 'parity' still answers "
+                  f"({len(after['chunks'])} chunks), graph has {sorted(both)}")
+        base.drop_dataset("parity2")
+        if "parity2" in {d["dataset"] for d in base.datasets()}:
+            fail("drop_dataset left nodes behind")
+        else:
+            print("  OK    drop_dataset removes only that dataset")
+
         print("\nPARITY:", "PASS" if ok else "FAIL")
-        neo.close()
+        base.close()
         return 0 if ok else 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

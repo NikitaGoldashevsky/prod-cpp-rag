@@ -23,9 +23,10 @@ class Service:
         self.indexes: dict[str, idx_mod.LoadedIndex] = {}
         self.kind = (store_kind or store_mod.store_kind()).lower()
         self._neo: store_mod.Neo4jStore | None = None
+        self._graph_cache: dict[str, dict] = {}
         if self.kind == "neo4j":
-            # One driver shared by every index; the graph holds one dataset at
-            # a time, so multi-index search does not apply on this backend.
+            # One driver shared by every index; each index gets a view scoped to
+            # its own dataset, so several submodules can be live at once.
             self._neo = store_mod.Neo4jStore()
         if names:
             self.indexes = self._load(names)
@@ -36,8 +37,38 @@ class Service:
         loaded = idx_mod.load_all(names)
         if self._neo is not None:
             for item in loaded.values():
-                item._store = self._neo
+                item._store = self._neo.for_dataset(item.name)
         return loaded
+
+    # ---- graph readiness --------------------------------------------------
+    def graphs(self, refresh: bool = False) -> dict[str, dict]:
+        """What the Neo4j graph holds, keyed by dataset (empty for memory)."""
+        if self._neo is None:
+            return {}
+        if refresh or not self._graph_cache:
+            self._graph_cache = {r["dataset"]: r for r in self._neo.datasets()}
+        return self._graph_cache
+
+    def _ready(self, idx: "idx_mod.LoadedIndex") -> dict | None:
+        """Refuse to answer out of the wrong dataset.
+
+        Without this, `--store neo4j` happily answered from whatever happened to
+        be in the graph while `list_indexes` reported this index's file stats —
+        confident, wrong, and invisible. Refusing with the fix is the honest
+        behaviour.
+        """
+        if self._neo is None:
+            return None
+        info = self.graphs().get(idx.name)
+        if info is None:
+            info = self.graphs(refresh=True).get(idx.name)
+        if info is None or not info.get("entities"):
+            have = ", ".join(sorted(self._graph_cache)) or "none"
+            raise store_mod.StoreNotReady(
+                f"index {idx.name!r} is not in the Neo4j graph, so answering would "
+                f"use the wrong data. Push it:  prod-rag neo4j push {idx.name}\n"
+                f"graph holds: {have}")
+        return info
 
     # ---- registry ---------------------------------------------------------
     def reload(self, names: list[str] | None = None) -> list[str]:
@@ -74,6 +105,7 @@ class Service:
     # ---- status -----------------------------------------------------------
     def status(self, deep: bool = True) -> list[dict]:
         rows = []
+        graphs = self.graphs()
         for name in self.names():
             idx = self.indexes[name]
             row = {
@@ -82,7 +114,23 @@ class Service:
                 "root": idx.root,
                 "built_at": idx.built_at,
                 "stats": idx.stats,
+                "store": None,
             }
+            if self._neo is not None:
+                info = graphs.get(name)
+                want = (idx.stats or {}).get("entities")
+                row["store"] = {
+                    "backend": "neo4j",
+                    "ready": bool(info and info.get("entities")),
+                    "entities": (info or {}).get("entities", 0),
+                    "pushed_at": (info or {}).get("pushed_at"),
+                }
+                if not info:
+                    row["store"]["hint"] = f"not pushed: prod-rag neo4j push {name}"
+                elif want and info.get("entities", 0) != want:
+                    row["store"]["hint"] = (
+                        f"graph has {info.get('entities')} entities, index has {want} — "
+                        f"re-push after reindexing: prod-rag neo4j push {name}")
             if deep:
                 fresh = idx.freshness(rescan=True)
                 row["freshness"] = {
@@ -101,6 +149,7 @@ class Service:
     def search(self, query: str, index: str | None = None, top_k: int = 8) -> dict:
         results = []
         for idx in self.pick(index):
+            self._ready(idx)
             r = idx.search(query, top_k=top_k)
             r["index"] = idx.name
             r["root"] = idx.root
@@ -118,6 +167,7 @@ class Service:
     def entity(self, name: str, index: str | None = None) -> dict:
         found = []
         for idx in self.pick(index):
+            self._ready(idx)
             payload = idx.entity(name)
             if payload:
                 found.append(payload)
@@ -131,6 +181,7 @@ class Service:
     def neighbours(self, name: str, index: str | None = None, hops: int = 1) -> dict:
         out = []
         for idx in self.pick(index):
+            self._ready(idx)
             r = idx.neighbours(name, hops=hops)
             if r.get("found"):
                 out.append(r)
@@ -143,6 +194,7 @@ class Service:
     def find(self, pattern: str, index: str | None = None, limit: int = 50) -> dict:
         hits = []
         for idx in self.pick(index):
+            self._ready(idx)
             for h in idx.find(pattern, limit=limit):
                 h["index"] = idx.name
                 hits.append(h)
@@ -156,16 +208,19 @@ class Service:
             pref, want = chunk_id.split("::", 1)
             cand = self.indexes.get(pref)
             if cand is not None:
+                self._ready(cand)
                 payload = cand.chunk(want)
                 if payload:
                     return {"found": True, **payload}
         for idx in self.pick(index):
+            self._ready(idx)
             payload = idx.chunk(want)
             if payload:
                 payload["id"] = f"{idx.name}::{payload['id']}"
                 return {"found": True, **payload}
         # Accept an entity name/qname too: agents often have one and not the id.
         for idx in self.pick(index):
+            self._ready(idx)
             eid = idx._resolve(want)
             if eid:
                 payload = idx.chunk(eid)
@@ -183,7 +238,18 @@ class Service:
             new_meta = idx_mod.build(name, meta["root"], exts=tuple(meta["exts"]),
                                      exclude=tuple(meta["exclude"]),
                                      label=meta.get("label"), verbose=verbose)
-            self.indexes[name] = idx_mod.load(name)
+            loaded = idx_mod.load(name)
+            if self._neo is not None:
+                # Rebuild and push together: a rebuilt file index whose graph
+                # still holds yesterday's entities is the exact silent-wrong-
+                # answer failure this backend must not have.
+                loaded._store = self._neo.for_dataset(name)
+                stats = self._neo.load_index(loaded.payload, clear=True)
+                self._graph_cache[name] = {
+                    "dataset": name, "entities": stats["entities"],
+                    "chunks": stats["chunks"], "pushed_at": None}
+                new_meta = dict(new_meta, pushed=stats)
+            self.indexes[name] = loaded
             return new_meta
 
     # ---- model-backed Q&A (optional) -------------------------------------

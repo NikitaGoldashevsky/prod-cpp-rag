@@ -51,6 +51,21 @@ void Widget::broadcast(const std::string& msg) {
 }  // namespace shop
 """
 
+CPP_RANK = r"""
+class TcpClient {
+public:
+    void connect();
+};
+void TcpClient::connect() {}
+
+struct Machine {
+    void resetCpu();
+    void adjustCpu();
+};
+void Machine::resetCpu() {}
+void Machine::adjustCpu() {}
+"""
+
 CPP_HDR = r"""
 #pragma once
 #include <string>
@@ -147,7 +162,8 @@ def run(tmp: str):
     # ---- find ------------------------------------------------------------
     f = svc.find("Widget*")
     assert f["count"] >= 1, f
-    print(f"  [OK] find: {f['count']} matches")
+    assert all(h["match"] == "glob" for h in f["matches"]), f
+    print(f"  [OK] find: {f['count']} matches (glob)")
 
     # ---- freshness: fresh, then stale, then reindex ----------------------
     idx = svc.get("proj")
@@ -190,12 +206,44 @@ def run(tmp: str):
     assert st.returncode in (0, 2), (st.returncode, st.stderr)
     print("  [OK] CLI list/status")
 
+    # ---- find ranks word matches above accidents -------------------------
+    # "Tcp" is really a substring of "resetCpu" (rese-tcp-u), and substring
+    # search is correct — but a real TcpClient must sort first, and every hit
+    # must say which kind of match it is. Otherwise an agent believes a symbol
+    # exists when it only matched mid-word.
+    rank_root = os.path.join(tmp, "rank")
+    os.makedirs(rank_root)
+    with open(os.path.join(rank_root, "cpu.cpp"), "w") as fh:
+        fh.write(CPP_RANK)
+    idx_mod.build("rank", rank_root, verbose=False)
+    svc3 = Service(["rank"])
+    hits = svc3.find("Tcp")["matches"]
+    assert hits and hits[0]["qname"].startswith("Tcp"), hits
+    assert hits[0]["match"] in ("exact", "prefix", "word"), hits[0]
+    assert any(h["match"] == "substring" for h in hits), hits
+    print(f"  [OK] find ranks {hits[0]['qname']} ({hits[0]['match']}) above "
+          f"substring noise ({len(hits)} hits)")
+
+    # ---- generated code stays out of the index --------------------------
+    # A moc_ file defines the same class without a body; indexing it makes a
+    # class name resolve to a stub with no members, calls or callers.
+    gen_root = os.path.join(tmp, "gen")
+    os.makedirs(os.path.join(gen_root, "obj"))
+    with open(os.path.join(gen_root, "real.cpp"), "w") as fh:
+        fh.write("class Widget { public: void run(); };\nvoid Widget::run() {}\n")
+    for path in ("obj/moc_widget.cpp", "moc_widget2.cpp", "ui_widget.h"):
+        with open(os.path.join(gen_root, path), "w") as fh:
+            fh.write("class Widget { public: void run(); };\n")
+    meta_g = idx_mod.build("gen", gen_root, verbose=False)
+    assert meta_g["stats"]["files"] == 1, meta_g["stats"]
+    print("  [OK] generated moc_/ui_/obj files are not indexed")
+
     # ---- multi-index facade ---------------------------------------------
     idx_mod.build("proj2", root, verbose=False)
     svc2 = Service(None)
     res = svc2.search("Widget", top_k=2)
-    assert "indexes" in res and len(res["indexes"]) == 2, list(res)
-    print("  [OK] multi-index search returns per-index groups")
+    assert "indexes" in res and len(res["indexes"]) >= 2, list(res)
+    print(f"  [OK] multi-index search returns {len(res['indexes'])} per-index groups")
 
 
 def main() -> int:

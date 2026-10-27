@@ -48,7 +48,17 @@ DEFAULT_EXCLUDE = (
     ".git", ".hg", ".svn", "build", "cmake-build-debug", "cmake-build-release",
     "node_modules", ".venv", "venv", "__pycache__", ".cache", "third_party",
     "3rdparty", "external", "dist", ".idea", ".vscode", "target", "out",
+    # compiler and Qt output trees. Indexing them is worse than useless: the
+    # generated moc_/ui_ classes shadow the real ones, and a class name then
+    # resolves to a body-less stub (seen on a real 2050-file submodule).
+    # Kept deliberately short: excluding a *source* directory by guesswork
+    # would silently drop real code, which is worse than indexing a build tree.
+    "obj", "CMakeFiles", "automoc",
 )
+
+# Generated translation units, matched on the file name.
+GENERATED_PREFIXES = ("moc_", "ui_", "qrc_")
+GENERATED_MARKERS = ("_generated.", ".pb.", ".pb-c.", "_automoc.cpp")
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +113,9 @@ def scan(root: str, exts=CPP_EXTS, exclude=DEFAULT_EXCLUDE, follow_symlinks=Fals
             rel_dir = ""
         for fn in sorted(filenames):
             if not fn.lower().endswith(exts):
+                continue
+            low = fn.lower()
+            if low.startswith(GENERATED_PREFIXES) or any(m in low for m in GENERATED_MARKERS):
                 continue
             full = os.path.join(dirpath, fn)
             try:
@@ -189,12 +202,17 @@ def build(name: str, root: str, exts=CPP_EXTS, exclude=DEFAULT_EXCLUDE,
             f"no C/C++ files under {root} "
             f"(extensions {', '.join(exts)}; exclusions {', '.join(exclude)})")
 
-    if len(files) > 1:
-        onto = oc.build_from_dir(root, with_retriever=with_retriever)
-    else:
-        onto = oc.build_from_file(os.path.join(root, next(iter(files))))
+    # One walk, one truth: the ontology is built from exactly the files that
+    # `scan()` hashed, so freshness can never disagree with what was parsed.
+    paths = sorted(files)
+    if len(paths) > 1:
+        onto = oc.build_from_files(paths, root=root, with_retriever=with_retriever)
+    elif paths:
+        onto = oc.build_from_file(os.path.join(root, paths[0]))
         if not with_retriever:
             onto._bm25 = None
+    else:                                                    # pragma: no cover
+        raise ValueError(f"no C/C++ files under {root}")
     if with_retriever:
         onto.build_retriever()      # BM25 over every chunk; skipped for Neo4j,
                                     # where Lucene does the lexical work
@@ -289,20 +307,64 @@ def exists(name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 class LoadedIndex:
-    """One index, opened: ontology in memory, BM25 built, freshness known."""
+    """One index, opened lazily.
 
-    def __init__(self, payload: dict, store: "object | None" = None):
-        self.payload = payload
+    Only `meta.json` is read up front. The big `index.json` (tens of MB for a
+    40k-entity submodule) is opened on first actual use, so an MCP server that
+    exposes eight indexes starts in milliseconds instead of tens of seconds and
+    pays the parse cost only for the index a question actually touches.
+    """
+
+    def __init__(self, name: str, store: "object | None" = None,
+                 meta: dict | None = None, payload: dict | None = None):
         self._store = store          # GraphStore; defaults to MemoryStore
-        self.name = payload["name"]
-        self.label = payload.get("label") or self.name
-        self.root = payload["root"]
-        self.files: dict = payload.get("files", {})
-        self.dirs: dict = payload.get("dirs", {})
-        self.stats: dict = payload.get("stats", {})
-        self.built_at = payload.get("updated_at") or payload.get("created_at")
+        self._meta = meta or {}
+        self._payload = payload
+        self.name = name
+        self.label = self._meta.get("label") or name
+        self.root = self._meta.get("root") or ""
+        self.built_at = (self._meta.get("updated_at")
+                         or self._meta.get("created_at"))
         self._onto: oc.CppOntology | None = None
         self._fresh: dict | None = None
+
+    # ---- lazy payload -----------------------------------------------------
+    @property
+    def payload(self) -> dict:
+        if self._payload is None:
+            path = os.path.join(index_dir(self.name), "index.json")
+            with open(path, encoding="utf-8") as f:
+                self._payload = json.load(f)
+            if not self._meta:
+                self._meta = {k: self._payload.get(k) for k in
+                              ("label", "root", "stats", "updated_at",
+                               "created_at", "exts", "exclude")}
+                self.label = self._meta.get("label") or self.name
+                self.root = self._meta.get("root") or ""
+                self.built_at = (self._meta.get("updated_at")
+                                 or self._meta.get("created_at"))
+        return self._payload
+
+    @property
+    def stats(self) -> dict:
+        return self._meta.get("stats") or self.payload.get("stats", {})
+
+    @property
+    def files(self) -> dict:
+        return self.payload.get("files", {})
+
+    @property
+    def dirs(self) -> dict:
+        return self.payload.get("dirs", {})
+
+    @property
+    def exts(self) -> tuple:
+        return tuple(self._meta.get("exts") or self.payload.get("exts") or CPP_EXTS)
+
+    @property
+    def exclude(self) -> tuple:
+        return tuple(self._meta.get("exclude") or self.payload.get("exclude")
+                     or DEFAULT_EXCLUDE)
 
     # ---- ontology ---------------------------------------------------------
     @property
@@ -337,9 +399,7 @@ class LoadedIndex:
             self._fresh = result
             return result
 
-        cur_files, cur_dirs = scan(self.root,
-                                   exts=tuple(self.payload.get("exts") or CPP_EXTS),
-                                   exclude=tuple(self.payload.get("exclude") or DEFAULT_EXCLUDE))
+        cur_files, cur_dirs = scan(self.root, exts=self.exts, exclude=self.exclude)
         old_files, old_dirs = self.files, self.dirs
 
         changed, added, removed = [], [], []
@@ -436,8 +496,15 @@ def load(name: str, store=None) -> LoadedIndex:
     path = os.path.join(index_dir(name), "index.json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"no index named {name!r} (see `prod-rag index list`)")
-    with open(path, encoding="utf-8") as f:
-        return LoadedIndex(json.load(f), store=store)
+    meta_path = os.path.join(index_dir(name), "meta.json")
+    meta = None
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            meta = None
+    return LoadedIndex(name, store=store, meta=meta)
 
 
 def load_all(names: list[str] | None = None) -> dict[str, LoadedIndex]:

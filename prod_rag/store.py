@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Protocol
 
 from . import core as oc
@@ -61,6 +62,74 @@ def neo4j_settings(env_path: str | None = None) -> dict:
 
 def store_kind() -> str:
     return (os.environ.get("PROD_RAG_STORE") or "memory").strip().lower()
+
+
+class StoreNotReady(RuntimeError):
+    """The graph cannot answer for this index (not pushed, or pushed empty).
+
+    Raised instead of returning a confidently wrong answer. The message always
+    names the command that fixes it.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Symbol matching (shared by both backends so they cannot drift)
+# ---------------------------------------------------------------------------
+
+_CAMEL_BREAK = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _word_starts(text: str) -> set[int]:
+    """Offsets where a new word begins: after ::, _, /, or a CamelCase hump."""
+    starts = {0}
+    for i, ch in enumerate(text):
+        if ch in "::_/ " or ch in ".-><":
+            starts.add(i + 1)
+    for m in _CAMEL_BREAK.finditer(text):
+        starts.add(m.start())
+    return starts
+
+
+def match_rank(qname: str, name: str, pattern: str) -> tuple[int, str]:
+    """How well a symbol matches, best first.
+
+    Substring search is what users expect, but it is also what makes
+    `find_symbol("Tcp")` return `adjustCpu` (the letters *tcp* really are in
+    there). So hits are still returned, but ranked: a match that starts on a
+    word boundary beats one buried mid-word, and each hit says which it is.
+    """
+    if any(ch in pattern for ch in "*?[]"):
+        return 0, "glob"
+    p = pattern.lower()
+    best: tuple[int, str] | None = None
+    for text in (qname, name):
+        if not text:
+            continue
+        low = text.lower()
+        if low == p:
+            return 0, "exact"
+        idx = low.find(p)
+        if idx < 0:
+            continue
+        cand = (1, "prefix") if idx == 0 else \
+               (2, "word") if idx in _word_starts(text) else (3, "substring")
+        if best is None or cand[0] < best[0]:
+            best = cand
+    return best or (3, "substring")
+
+
+def rank_symbol_hits(hits: list[dict], pattern: str, limit: int) -> list[dict]:
+    """Sort hits word-boundary-first and annotate each with its `match` kind."""
+    out = []
+    for h in hits:
+        qn = h.get("qname") or ""
+        nm = h.get("name") or qn.rsplit("::", 1)[-1]
+        rank, kind = match_rank(qn, nm, pattern)
+        out.append({**h, "_rank": rank, "match": kind})
+    out.sort(key=lambda h: (h["_rank"], len(h.get("qname") or ""),
+                            h.get("qname") or ""))
+    drop = ("_rank", "name_lc", "qname_lc")
+    return [{k: v for k, v in h.items() if k not in drop} for h in out[:limit]]
 
 
 # ---------------------------------------------------------------------------
@@ -199,15 +268,17 @@ class MemoryStore:
         globbed = any(ch in pattern for ch in "*?[]")
         hits = []
         for eid, e in onto.entities.items():
-            target = (e.qname or e.name).lower()
+            qn = e.qname or e.name
+            target = qn.lower()
             ok = (fnmatch.fnmatch(target, pat) or fnmatch.fnmatch(e.name.lower(), pat)) \
-                if globbed else pat in target
+                if globbed else (pat in target or pat in e.name.lower())
             if ok and e.kind not in ("Parameter", "File", "GlobalBlock", "Header"):
-                hits.append({"id": eid, "kind": e.kind, "qname": e.qname or e.name,
+                hits.append({"id": eid, "kind": e.kind, "qname": qn,
+                             "name": e.name,
                              "file": e.file, "line_start": e.line_start,
                              "is_definition": e.is_definition})
         hits.sort(key=lambda h: (len(h["qname"]), h["qname"]))
-        return hits[:limit]
+        return rank_symbol_hits(hits, pattern, limit)
 
     def chunk(self, chunk_id: str) -> dict | None:
         return next((c for c in self.onto.chunks if c["id"] == chunk_id), None)
@@ -235,8 +306,16 @@ LITERAL_PREDICATES = {"inheritsFrom", "callsExternal", "throws", "aliasOf"}
 ENTITY_REL_TYPES = [t for p, t in REL_TYPES.items() if p not in LITERAL_PREDICATES]
 
 SCHEMA = [
-    "CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (n:Entity) REQUIRE n.id IS UNIQUE",
-    "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (n:Chunk) REQUIRE n.id IS UNIQUE",
+    # Composite uniqueness: the same entity id may exist in several datasets
+    # (one per indexed submodule), so `id` alone is no longer a key.
+    "DROP CONSTRAINT entity_id IF EXISTS",
+    "DROP CONSTRAINT chunk_id IF EXISTS",
+    "CREATE CONSTRAINT entity_dataset_id IF NOT EXISTS "
+    "FOR (n:Entity) REQUIRE (n.dataset, n.id) IS UNIQUE",
+    "CREATE CONSTRAINT chunk_dataset_id IF NOT EXISTS "
+    "FOR (n:Chunk) REQUIRE (n.dataset, n.id) IS UNIQUE",
+    "CREATE CONSTRAINT dataset_name IF NOT EXISTS "
+    "FOR (n:Dataset) REQUIRE n.name IS UNIQUE",
     "CREATE INDEX entity_name IF NOT EXISTS FOR (n:Entity) ON (n.name)",
     "CREATE INDEX entity_qname IF NOT EXISTS FOR (n:Entity) ON (n.qname)",
     "CREATE INDEX entity_qname_lc IF NOT EXISTS FOR (n:Entity) ON (n.qname_lc)",
@@ -249,22 +328,46 @@ SCHEMA = [
 
 
 class Neo4jStore:
-    """The ontology in Neo4j. Query paths are Cypher; ranking is index-driven."""
+    """The ontology in Neo4j. Query paths are Cypher; ranking is index-driven.
+
+    Every node carries a `dataset` property naming the index it came from, and
+    every query filters on it. That is what lets one Neo4j instance hold several
+    submodules at once — and, just as important, what stops a query from
+    answering out of a *different* index than the one the caller asked for.
+    """
 
     name = "neo4j"
     MAX_NEIGHBOURS = 300
 
-    def __init__(self, database: str = "neo4j", env_path: str | None = None):
-        from neo4j import GraphDatabase
-        c = neo4j_settings(env_path)
-        self.uri = c["uri"]
+    def __init__(self, dataset: str | None = None, database: str = "neo4j",
+                 env_path: str | None = None, driver=None, uri: str | None = None):
+        self.dataset = dataset
         self.database = database
-        self.driver = GraphDatabase.driver(
-            c["uri"], auth=(c["user"], c["password"]),
-            warn_notification_severity="OFF", max_connection_pool_size=16)
-        self.driver.verify_connectivity()
+        self._owns_driver = driver is None
+        if driver is None:
+            from neo4j import GraphDatabase
+            c = neo4j_settings(env_path)
+            self.uri = uri or c["uri"]
+            driver = GraphDatabase.driver(
+                self.uri, auth=(c["user"], c["password"]),
+                warn_notification_severity="OFF", max_connection_pool_size=16)
+            driver.verify_connectivity()
+        else:
+            self.uri = uri or "neo4j"
+        self.driver = driver
 
     # ---- helpers ---------------------------------------------------------
+    def for_dataset(self, dataset: str) -> "Neo4jStore":
+        """A view of this connection scoped to one dataset (shares the driver)."""
+        return Neo4jStore(dataset=dataset, database=self.database,
+                          driver=self.driver, uri=self.uri)
+
+    def _ds(self) -> str:
+        if not self.dataset:
+            raise StoreNotReady(
+                "this Neo4j handle is not bound to a dataset; use for_dataset(name)")
+        return self.dataset
+
     def _session(self):
         return self.driver.session(database=self.database,
                                    notifications_min_severity="OFF")
@@ -279,17 +382,83 @@ class Neo4jStore:
         for i in range(0, len(seq), n):
             yield seq[i:i + n]
 
+    # ---- dataset state ---------------------------------------------------
+    def dataset_info(self, dataset: str | None = None) -> dict | None:
+        """What the graph holds for one dataset, or None if it holds nothing."""
+        ds = dataset or self.dataset
+        if not ds:
+            raise ValueError("dataset_info() needs a dataset name")
+        with self._session() as s:
+            rec = s.run(
+                "MATCH (d:Dataset {name:$ds}) "
+                "RETURN d.name AS name, d.pushed_at AS pushed_at, "
+                "       d.index_built_at AS index_built_at, d.root AS root",
+                ds=ds).single()
+            counts = s.run(
+                "MATCH (e:Entity {dataset:$ds}) WITH count(e) AS entities "
+                "CALL { WITH entities MATCH (c:Chunk {dataset:$ds}) "
+                "       RETURN count(c) AS chunks } "
+                "RETURN entities, chunks", ds=ds).single()
+        if not rec and not counts["entities"]:
+            return None
+        return {"dataset": ds,
+                "entities": counts["entities"],
+                "chunks": counts["chunks"],
+                "pushed_at": rec["pushed_at"] if rec else None,
+                "index_built_at": rec["index_built_at"] if rec else None,
+                "root": rec["root"] if rec else None}
+
+    def datasets(self) -> list[dict]:
+        """Every dataset in the graph, with the counts each query path sees."""
+        stmts = (
+            "MATCH (e:Entity) WHERE e.dataset IS NOT NULL "
+            "WITH e.dataset AS dataset, count(e) AS entities "
+            "CALL { WITH dataset MATCH (c:Chunk {dataset: dataset}) "
+            "       RETURN count(c) AS chunks } "
+            "RETURN dataset, entities, chunks ORDER BY dataset")
+        with self._session() as s:
+            rows = s.run(stmts).data()
+            meta = {r["name"]: r for r in s.run(
+                "MATCH (d:Dataset) RETURN d.name AS name, d.pushed_at AS pushed_at, "
+                "d.index_built_at AS index_built_at, d.root AS root").data()}
+        out = []
+        for r in rows:
+            m = meta.get(r["dataset"], {})
+            out.append({"dataset": r["dataset"], "entities": r["entities"],
+                        "chunks": r["chunks"],
+                        "pushed_at": m.get("pushed_at"),
+                        "index_built_at": m.get("index_built_at"),
+                        "root": m.get("root")})
+        return out
+
+    def assert_ready(self) -> dict:
+        """Raise StoreNotReady (with a fix) unless this dataset is in the graph."""
+        info = self.dataset_info()
+        if info is None or not info["entities"]:
+            raise StoreNotReady(
+                f"index {self.dataset!r} is not in the Neo4j graph at {self.uri}. "
+                f"Push it first:  prod-rag neo4j push {self.dataset}  "
+                f"(or rebuild:  prod-rag index add {self.dataset} <path> --store neo4j). "
+                f"Graph datasets: "
+                f"{', '.join(d['dataset'] for d in self.datasets()) or 'none'}")
+        return info
+
     # ---- loading an index ------------------------------------------------
     def load_index(self, payload: dict, clear: bool = True) -> dict:
-        """Replace the graph contents with one index snapshot."""
+        """Write one index snapshot into its own dataset."""
+        ds = payload.get("name") or self.dataset
+        if not ds:
+            raise ValueError("payload has no index name")
         self.ensure_schema()
-        stats = {"entities": 0, "chunks": 0, "relations": 0}
+        stats = {"dataset": ds, "entities": 0, "chunks": 0, "relations": 0}
         with self._session() as s:
             if clear:
-                for lab in list(KIND_LABELS) + ["Entity", "Chunk", "ExternalSymbol",
-                                                "ExternalBase", "ThrowType"]:
-                    s.run(f"MATCH (n:{lab}) CALL (n) {{ DETACH DELETE n }} "
-                          "IN TRANSACTIONS OF 5000 ROWS").consume()
+                # Only this dataset: other submodules stay queryable.
+                s.run(
+                    "MATCH (n) WHERE n.dataset = $ds "
+                    "CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF 5000 ROWS",
+                    ds=ds).consume()
+                s.run("MATCH (d:Dataset {name:$ds}) DETACH DELETE d", ds=ds).consume()
 
             # entity nodes, one statement per kind label
             all_labels = "".join(f":{x}" for x in KIND_LABELS)
@@ -298,7 +467,8 @@ class Neo4jStore:
                 label = e["kind"] if e["kind"] in KIND_LABELS else None
                 if label is None:
                     continue
-                props = {"id": e["id"], "kind": e["kind"], "name": e.get("name") or "",
+                props = {"id": e["id"], "dataset": ds, "kind": e["kind"],
+                         "name": e.get("name") or "",
                          "qname": e.get("qname") or "",
                          "qname_lc": (e.get("qname") or e.get("name") or "").lower(),
                          "name_lc": (e.get("name") or "").lower(),
@@ -322,8 +492,10 @@ class Neo4jStore:
             for label, rows in by_label.items():
                 for chunk in self._batch(rows, 1000):
                     s.run(f"UNWIND $rows AS row "
-                          f"MERGE (n:Entity {{id: row.id}}) REMOVE n{all_labels} "
-                          f"SET n = row.props SET n:{label}", rows=chunk).consume()
+                          f"MERGE (n:Entity {{dataset: $ds, id: row.id}}) "
+                          f"REMOVE n{all_labels} "
+                          f"SET n = row.props SET n:{label}", rows=chunk,
+                          ds=ds).consume()
                     stats["entities"] += len(chunk)
 
             # relationships (multiset preserved via `ords`)
@@ -341,12 +513,13 @@ class Neo4jStore:
             for rtype, rows in by_type.items():
                 for chunk in self._batch(rows, 5000):
                     s.run(f"UNWIND $rows AS row "
-                          f"MATCH (a:Entity {{id: row.s}}) MATCH (b:Entity {{id: row.o}}) "
+                          f"MATCH (a:Entity {{dataset: $ds, id: row.s}}) "
+                          f"MATCH (b:Entity {{dataset: $ds, id: row.o}}) "
                           f"MERGE (a)-[r:{rtype}]->(b) SET r.ords = row.ords",
-                          rows=chunk).consume()
+                          rows=chunk, ds=ds).consume()
                     stats["relations"] += sum(len(r["ords"]) for r in chunk)
 
-            # literal objects -> stub nodes
+            # literal objects -> stub nodes (scoped to the dataset too)
             for pred, rel, label, key in (
                     ("callsExternal", "CALLS_EXTERNAL", "ExternalSymbol", "name"),
                     ("inheritsFrom", "INHERITS_FROM", "ExternalBase", "name")):
@@ -357,10 +530,10 @@ class Neo4jStore:
                 rows = [{"s": a, "o": b, "ords": o} for (a, b), o in g.items()]
                 for chunk in self._batch(rows, 5000):
                     s.run(f"UNWIND $rows AS row "
-                          f"MATCH (a:Entity {{id: row.s}}) "
-                          f"MERGE (b:{label} {{{key}: row.o}}) "
+                          f"MATCH (a:Entity {{dataset: $ds, id: row.s}}) "
+                          f"MERGE (b:{label} {{dataset: $ds, {key}: row.o}}) "
                           f"MERGE (a)-[r:{rel}]->(b) SET r.ords = row.ords",
-                          rows=chunk).consume()
+                          rows=chunk, ds=ds).consume()
                     stats["relations"] += sum(len(r["ords"]) for r in chunk)
 
             # throws (guarded flag on the edge). Site details live on the
@@ -384,53 +557,94 @@ class Neo4jStore:
             rows = [{"s": a, "o": b, "guarded": g_, "line": ln, "ords": o}
                     for (a, b, g_, ln), o in tg.items()]
             for chunk in self._batch(rows, 5000):
-                s.run("UNWIND $rows AS row MATCH (a:Entity {id: row.s}) "
-                      "MERGE (b:ThrowType {name: row.o}) "
+                s.run("UNWIND $rows AS row "
+                      "MATCH (a:Entity {dataset: $ds, id: row.s}) "
+                      "MERGE (b:ThrowType {dataset: $ds, name: row.o}) "
                       "MERGE (a)-[t:THROWS {line: row.line, guarded: row.guarded}]->(b) "
-                      "SET t.ords = row.ords", rows=chunk).consume()
+                      "SET t.ords = row.ords", rows=chunk, ds=ds).consume()
                 stats["relations"] += sum(len(r["ords"]) for r in chunk)
 
             # chunks
-            rows = [{"id": c["id"], "kind": c.get("kind") or "", "qname": c.get("qname") or "",
+            rows = [{"id": c["id"], "kind": c.get("kind") or "",
+                     "qname": c.get("qname") or "",
                      "file": c.get("file") or "", "line_start": c.get("line_start") or 0,
                      "line_end": c.get("line_end") or 0, "text": c.get("text") or "",
                      "ord": i}
                     for i, c in enumerate(payload["chunks"])]
             for chunk in self._batch(rows, 200):
-                s.run("UNWIND $rows AS row MERGE (c:Chunk {id: row.id}) SET c = row "
-                      "WITH c, row MATCH (e:Entity {id: row.id}) "
-                      "MERGE (c)-[:DESCRIBES]->(e)", rows=chunk).consume()
+                s.run("UNWIND $rows AS row "
+                      "MERGE (c:Chunk {dataset: $ds, id: row.id}) "
+                      "SET c = row, c.dataset = $ds "
+                      "WITH c, row MATCH (e:Entity {dataset: $ds, id: row.id}) "
+                      "MERGE (c)-[:DESCRIBES]->(e)", rows=chunk, ds=ds).consume()
                 stats["chunks"] += len(chunk)
+
+            # record the dataset itself so `list_indexes` can show what the
+            # graph holds and when it was pushed
+            s.run(
+                "MERGE (d:Dataset {name:$ds}) "
+                "SET d.pushed_at = $pushed, d.index_built_at = $built, d.root = $root, "
+                "    d.entities = $entities, d.chunks = $chunks, d.relations = $relations",
+                ds=ds, pushed=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                built=payload.get("updated_at") or payload.get("created_at"),
+                root=payload.get("root") or "",
+                entities=stats["entities"], chunks=stats["chunks"],
+                relations=stats["relations"]).consume()
         return stats
+
+    def drop_dataset(self, dataset: str) -> bool:
+        """Remove one dataset (its nodes, chunks and stubs) from the graph."""
+        with self._session() as s:
+            got = s.run("MATCH (d:Dataset {name:$ds}) RETURN count(d) AS n",
+                        ds=dataset).single()["n"]
+            s.run("MATCH (n) WHERE n.dataset = $ds "
+                  "CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF 5000 ROWS",
+                  ds=dataset).consume()
+            s.run("MATCH (d:Dataset {name:$ds}) DETACH DELETE d", ds=dataset).consume()
+        return bool(got)
+
+    def clear_all(self) -> None:
+        """Wipe every dataset — including nodes pushed before datasets existed."""
+        with self._session() as s:
+            for lab in list(KIND_LABELS) + ["Entity", "Chunk", "ExternalSymbol",
+                                            "ExternalBase", "ThrowType"]:
+                s.run(f"MATCH (n:{lab}) "
+                      "CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF 5000 ROWS").consume()
+            s.run("MATCH (d:Dataset) DETACH DELETE d").consume()
 
     # ---- queries ---------------------------------------------------------
     def search(self, query: str, top_k: int = 8, hops: int = 1) -> dict:
         """Full-text over entities and chunks, then one hop for surrounding facts."""
+        ds = self._ds()
         like = _fts_query(query)
         linked, chunks = [], []
         with self._session() as s:
             if like:
+                # The full-text index streams in score order, so the dataset
+                # filter costs nothing extra: LIMIT stops the scan.
                 for rec in s.run(
-                        "CALL db.index.fulltext.queryNodes('entity_text', $q, {limit: 40}) "
+                        "CALL db.index.fulltext.queryNodes('entity_text', $q) "
                         "YIELD node, score "
-                        "WHERE node:Entity AND NOT node:Parameter AND NOT node:File "
+                        "WHERE node:Entity AND node.dataset = $ds "
+                        "AND NOT node:Parameter AND NOT node:File "
                         "AND NOT node:GlobalBlock AND NOT node:Header "
                         "RETURN node.id AS id, node.name AS name, node.qname AS qname, "
                         "node.kind AS kind, node.file AS file, node.line_start AS ls, "
                         "node.line_end AS le, score ORDER BY score DESC LIMIT $k",
-                        q=like, k=max(3, top_k)):
+                        q=like, ds=ds, k=max(3, top_k)):
                     if rec["id"] not in {x["id"] for x in linked}:
                         linked.append({"id": rec["id"], "name": rec["name"],
                                        "qname": rec["qname"] or rec["name"],
                                        "kind": rec["kind"], "file": rec["file"],
                                        "line_start": rec["ls"], "line_end": rec["le"]})
                 for rec in s.run(
-                        "CALL db.index.fulltext.queryNodes('chunk_text', $q, {limit: 40}) "
+                        "CALL db.index.fulltext.queryNodes('chunk_text', $q) "
                         "YIELD node, score "
+                        "WHERE node.dataset = $ds "
                         "RETURN node.id AS id, node.kind AS kind, node.qname AS qname, "
                         "node.file AS file, node.line_start AS ls, node.line_end AS le, "
                         "node.text AS text, score ORDER BY score DESC LIMIT $k",
-                        q=like, k=top_k):
+                        q=like, ds=ds, k=top_k):
                     chunks.append({"id": rec["id"], "kind": rec["kind"],
                                    "qname": rec["qname"], "file": rec["file"],
                                    "line_start": rec["ls"], "line_end": rec["le"],
@@ -441,11 +655,11 @@ class Neo4jStore:
             if not chunks:
                 seen = set()
                 for rec in s.run(
-                        "MATCH (c:Chunk)-[:DESCRIBES]->(e:Entity) "
+                        "MATCH (c:Chunk {dataset:$ds})-[:DESCRIBES]->(e:Entity {dataset:$ds}) "
                         "WHERE e.id IN $ids RETURN c.id AS id, c.kind AS kind, "
                         "c.qname AS qname, c.file AS file, c.line_start AS ls, "
                         "c.line_end AS le, c.text AS text LIMIT $k",
-                        ids=[x["id"] for x in linked][:8], k=top_k):
+                        ds=ds, ids=[x["id"] for x in linked][:8], k=top_k):
                     if rec["id"] in seen:
                         continue
                     seen.add(rec["id"])
@@ -463,47 +677,52 @@ class Neo4jStore:
     def _facts_for(self, ids: list[str], hops: int = 1) -> str:
         if not ids:
             return ""
+        ds = self._ds()
         h = max(1, min(hops, 3))
         with self._session() as s:
             rec = s.run(
-                f"MATCH (e:Entity) WHERE e.id IN $ids "
+                f"MATCH (e:Entity {{dataset:$ds}}) WHERE e.id IN $ids "
                 f"OPTIONAL MATCH (e)-[*1..{h}]-(n:Entity) "
                 f"WITH collect(DISTINCT e) + collect(DISTINCT n) AS nodes "
                 f"UNWIND nodes AS x "
-                f"WITH DISTINCT x WHERE x.fact_card IS NOT NULL AND x.fact_card <> '' "
+                f"WITH DISTINCT x WHERE x.dataset = $ds "
+                f"AND x.fact_card IS NOT NULL AND x.fact_card <> '' "
                 f"AND NOT x:File AND NOT x:GlobalBlock "
                 f"RETURN x.fact_card AS card, x.ord AS ord ORDER BY ord",
-                ids=ids).data()
+                ids=ids, ds=ds).data()
         return "\n\n".join(r["card"] for r in rec)
 
     def entity(self, name: str) -> dict | None:
+        ds = self._ds()
         with self._session() as s:
             rec = s.run(
-                "MATCH (e:Entity) WHERE e.qname = $n OR e.name = $n "
+                "MATCH (e:Entity {dataset:$ds}) "
+                "WHERE e.qname = $n OR e.name = $n "
                 "   OR e.qname_lc = $lc OR e.name_lc = $lc OR e.id = $n "
                 "RETURN e ORDER BY coalesce(e.is_definition,true) DESC, "
                 "  size(coalesce(e.qname,'')) ASC LIMIT 1",
-                n=name, lc=name.lower()).single()
+                n=name, lc=name.lower(), ds=ds).single()
             if not rec:
                 rec = s.run(
-                    "MATCH (e:Entity) WHERE e.qname_lc CONTAINS $lc OR e.name_lc CONTAINS $lc "
+                    "MATCH (e:Entity {dataset:$ds}) "
+                    "WHERE e.qname_lc CONTAINS $lc OR e.name_lc CONTAINS $lc "
                     "RETURN e ORDER BY size(coalesce(e.qname,'')) ASC LIMIT 1",
-                    lc=name.lower()).single()
+                    lc=name.lower(), ds=ds).single()
             if not rec:
                 return None
             node = dict(rec["e"])
             eid = node["id"]
             rel = s.run(
-                "MATCH (a:Entity {id:$id})-[r]->(b) "
+                "MATCH (a:Entity {dataset:$ds, id:$id})-[r]->(b) "
                 "RETURN type(r) AS t, b.id AS o, b.qname AS oq, b.name AS oname, "
                 "       r.guarded AS guarded, r.line AS line, r.ords AS ords",
-                id=eid).data()
+                id=eid, ds=ds).data()
             inbound = s.run(
-                "MATCH (a:Entity)-[r]->(b:Entity {id:$id}) "
+                "MATCH (a:Entity {dataset:$ds})-[r]->(b:Entity {dataset:$ds, id:$id}) "
                 "RETURN type(r) AS t, a.id AS s, a.qname AS sq, a.name AS sname",
-                id=eid).data()
-            code = s.run("MATCH (c:Chunk {id:$id}) RETURN c.text AS text",
-                         id=eid).single()
+                id=eid, ds=ds).data()
+            code = s.run("MATCH (c:Chunk {dataset:$ds, id:$id}) RETURN c.text AS text",
+                         id=eid, ds=ds).single()
         label = lambda q, nm: q or nm
         def objs(t):
             return [label(r["oq"], r["oname"]) for r in rel if r["t"] == t]
@@ -538,13 +757,15 @@ class Neo4jStore:
         }
 
     def neighbours(self, name: str, hops: int = 1) -> dict:
+        ds = self._ds()
         h = max(1, min(hops, 3))
         with self._session() as s:
             # Same preference order as MemoryStore._resolve: exact qname, then
             # a definition, then the shortest name. Without ORDER BY, duplicate
             # class names across directories resolved to different nodes.
             root = s.run(
-                "MATCH (e:Entity) WHERE e.qname = $n OR e.name = $n OR e.id = $n "
+                "MATCH (e:Entity {dataset:$ds}) "
+                "WHERE e.qname = $n OR e.name = $n OR e.id = $n "
                 "   OR e.qname_lc = $lc OR e.name_lc = $lc "
                 "RETURN e.id AS id, "
                 "  CASE WHEN e.qname = $n THEN 0 WHEN e.name = $n THEN 1 "
@@ -552,14 +773,14 @@ class Neo4jStore:
                 "  coalesce(e.is_definition, true) AS def, "
                 "  size(coalesce(e.qname, e.name)) AS namelen, e.ord AS ord "
                 "ORDER BY rank, def DESC, namelen ASC, ord ASC LIMIT 1",
-                n=name, lc=name.lower()).single()
+                n=name, lc=name.lower(), ds=ds).single()
             if not root:
                 return {"found": False, "name": name}
             rid = root["id"]
             # Cap the expansion: a well-connected class two hops out can reach
             # tens of thousands of nodes, which is useless context and slow.
             rows = s.run(
-                f"MATCH (root:Entity {{id:$id}}) "
+                f"MATCH (root:Entity {{dataset:$ds, id:$id}}) "
                 f"OPTIONAL MATCH (root)-[*1..{h}]-(n:Entity) "
                 f"WITH root, collect(DISTINCT n) AS ns "
                 f"UNWIND [root] + ns[0..$cap] AS x "
@@ -567,10 +788,11 @@ class Neo4jStore:
                 f"       coalesce(x.qname, x.name) AS qname, x.file AS file, "
                 f"       x.fact_card AS card, x.ord AS ord, "
                 f"       (x:File OR x:GlobalBlock) AS skip "
-                f"ORDER BY ord", id=rid, cap=self.MAX_NEIGHBOURS).data()
+                f"ORDER BY ord", id=rid, ds=ds, cap=self.MAX_NEIGHBOURS).data()
             total = s.run(
-                f"MATCH (root:Entity {{id:$id}}) OPTIONAL MATCH (root)-[*1..{h}]-(n:Entity) "
-                f"RETURN count(DISTINCT n) AS n", id=rid).single()["n"]
+                f"MATCH (root:Entity {{dataset:$ds, id:$id}}) "
+                f"OPTIONAL MATCH (root)-[*1..{h}]-(n:Entity) "
+                f"RETURN count(DISTINCT n) AS n", id=rid, ds=ds).single()["n"]
         entities = [{"id": r["id"], "kind": r["kind"], "qname": r["qname"],
                      "file": r["file"]} for r in rows]
         # MemoryStore.fact_cards() skips File and GlobalBlock nodes; mirror it
@@ -584,39 +806,38 @@ class Neo4jStore:
         return out
 
     def find(self, pattern: str, limit: int = 50) -> list[dict]:
+        ds = self._ds()
         globbed = any(ch in pattern for ch in "*?[]")
         low = pattern.lower()
+        base = ("MATCH (e:Entity {dataset:$ds}) WHERE NOT e:Parameter AND NOT e:File "
+                "AND NOT e:Header AND NOT e:GlobalBlock AND ")
+        ret = ("RETURN e.id AS id, e.kind AS kind, coalesce(e.qname,e.name) AS qname, "
+               "e.name_lc AS name_lc, e.qname_lc AS qname_lc, e.file AS file, "
+               "e.line_start AS line_start, coalesce(e.is_definition,true) AS is_definition ")
         with self._session() as s:
             if globbed:
                 # translate a glob to a Cypher-safe regex
                 rx = "^" + re.escape(low).replace(r"\*", ".*").replace(r"\?", ".") + "$"
                 rows = s.run(
-                    "MATCH (e:Entity) WHERE NOT e:Parameter AND NOT e:File "
-                    "AND NOT e:Header AND NOT e:GlobalBlock "
-                    "AND (e.qname_lc =~ $rx OR e.name_lc =~ $rx) "
-                    "RETURN e.id AS id, e.kind AS kind, coalesce(e.qname,e.name) AS qname, "
-                    "e.file AS file, e.line_start AS line_start, "
-                    "coalesce(e.is_definition,true) AS is_definition "
+                    base + "(e.qname_lc =~ $rx OR e.name_lc =~ $rx) " + ret +
                     "ORDER BY size(coalesce(e.qname,e.name)), qname LIMIT $k",
-                    rx=rx, k=limit).data()
+                    rx=rx, k=limit * 4, ds=ds).data()
             else:
                 rows = s.run(
-                    "MATCH (e:Entity) WHERE NOT e:Parameter AND NOT e:File "
-                    "AND NOT e:Header AND NOT e:GlobalBlock "
-                    "AND (e.qname_lc CONTAINS $low OR e.name_lc CONTAINS $low) "
-                    "RETURN e.id AS id, e.kind AS kind, coalesce(e.qname,e.name) AS qname, "
-                    "e.file AS file, e.line_start AS line_start, "
-                    "coalesce(e.is_definition,true) AS is_definition "
+                    base + "(e.qname_lc CONTAINS $low OR e.name_lc CONTAINS $low) " + ret +
                     "ORDER BY size(coalesce(e.qname,e.name)), qname LIMIT $k",
-                    low=low, k=limit).data()
-        return rows
+                    low=low, k=limit * 4, ds=ds).data()
+        return rank_symbol_hits(rows, pattern, limit)
 
     def chunk(self, chunk_id: str) -> dict | None:
+        ds = self._ds()
         with self._session() as s:
             rec = s.run(
-                "MATCH (c:Chunk) WHERE c.id = $id RETURN c.id AS id, c.kind AS kind, "
+                "MATCH (c:Chunk {dataset:$ds}) WHERE c.id = $id "
+                "RETURN c.id AS id, c.kind AS kind, "
                 "c.qname AS qname, c.file AS file, c.line_start AS line_start, "
-                "c.line_end AS line_end, c.text AS text LIMIT 1", id=chunk_id).single()
+                "c.line_end AS line_end, c.text AS text LIMIT 1", id=chunk_id,
+                ds=ds).single()
             if rec:
                 return dict(rec)
             ent = self.entity(chunk_id)
@@ -628,18 +849,36 @@ class Neo4jStore:
         return None
 
     # ---- housekeeping ----------------------------------------------------
-    def stats(self) -> dict:
+    def stats(self, dataset: str | None = None) -> dict:
+        ds = dataset if dataset is not None else self.dataset
         with self._session() as s:
-            n = s.run("MATCH (e:Entity) RETURN count(e) AS n").single()["n"]
-            c = s.run("MATCH (c:Chunk) RETURN count(c) AS n").single()["n"]
+            if ds:
+                n = s.run("MATCH (e:Entity {dataset:$ds}) RETURN count(e) AS n",
+                          ds=ds).single()["n"]
+                c = s.run("MATCH (c:Chunk {dataset:$ds}) RETURN count(c) AS n",
+                          ds=ds).single()["n"]
+                r = s.run("MATCH (a:Entity {dataset:$ds})-[x]->() "
+                          "WHERE x.ords IS NOT NULL "
+                          "RETURN sum(size(x.ords)) AS n", ds=ds).single()["n"]
+                return {"dataset": ds, "entities": n, "chunks": c,
+                        "relations": r or 0}
+            n = s.run("MATCH (e:Entity) WHERE e.dataset IS NOT NULL "
+                      "RETURN count(e) AS n").single()["n"]
+            c = s.run("MATCH (c:Chunk) WHERE c.dataset IS NOT NULL "
+                      "RETURN count(c) AS n").single()["n"]
             r = s.run("MATCH ()-[x]->() WHERE x.ords IS NOT NULL "
                       "RETURN sum(size(x.ords)) AS n").single()["n"]
-        return {"entities": n, "chunks": c, "relations": r or 0}
+            legacy = s.run("MATCH (e:Entity) WHERE e.dataset IS NULL "
+                           "RETURN count(e) AS n").single()["n"]
+        out = {"entities": n, "chunks": c, "relations": r or 0,
+               "datasets": self.datasets()}
+        if legacy:
+            out["legacy_nodes_without_dataset"] = legacy
+        return out
 
     def close(self) -> None:
-        self.driver.close()
-
-
+        if self._owns_driver:
+            self.driver.close()
 def _fts_query(query: str) -> str:
     """Turn a natural-language question into a Lucene-friendly OR query.
 
@@ -677,7 +916,9 @@ def make_store(onto: oc.CppOntology | None = None, kind: str | None = None,
     """
     kind = (kind or store_kind()).lower()
     if kind == "neo4j":
-        return Neo4jStore()
+        if not payload or not payload.get("name"):
+            raise ValueError("a Neo4j store needs payload['name'] to pick its dataset")
+        return Neo4jStore(dataset=payload["name"])
     if onto is None:
         raise ValueError("MemoryStore needs an ontology")
     return MemoryStore(onto)

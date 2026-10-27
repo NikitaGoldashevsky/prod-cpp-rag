@@ -26,6 +26,7 @@ import sys
 
 from . import index as idx_mod
 from . import llm as llm_mod
+from . import store as store_mod
 from .service import Service
 
 # ---------------------------------------------------------------------------
@@ -62,15 +63,31 @@ def build_server(service: Service, chat=None):
     def _dumps(obj) -> str:
         return json.dumps(obj, ensure_ascii=False, indent=None)
 
+    def _safe(fn, *a, **kw) -> str:
+        """Run a service call, reporting a refusal as data the agent can act on.
+
+        An unhandled exception reaches the client as "Error executing tool X"
+        with the real reason only in the server's stderr — which the harness
+        usually hides. The graph-missing and unknown-index cases are ordinary
+        states, so they come back as a JSON body naming the fix.
+        """
+        try:
+            return _dumps(fn(*a, **kw))
+        except store_mod.StoreNotReady as e:
+            return _dumps({"error": "store_not_ready", "detail": str(e)})
+        except LookupError as e:
+            return _dumps({"error": "lookup_failed", "detail": str(e)})
+
     @mcp.tool()
     def list_indexes() -> str:
         """List the codebase indexes this server can answer from.
 
-        Each row carries its root path, size, build time and whether the working
-        tree has changed since the index was built. Call this first when you do
-        not know which index covers the code you are looking at.
+        Each row carries its root path, size, build time, whether the working
+        tree has changed since the index was built, and — on the Neo4j backend —
+        whether that index is actually in the graph (`store.ready`). Call this
+        first when you do not know which index covers the code you are looking at.
         """
-        return _dumps(service.status(deep=False))
+        return _safe(service.status, deep=False)
 
     @mcp.tool()
     def index_status(name: str = "") -> str:
@@ -81,11 +98,13 @@ def build_server(service: Service, chat=None):
         before trusting answers about code that may have changed, and after you
         edit files.
         """
-        if name:
-            idx = service.get(name)
-            return _dumps({"name": idx.name, "root": idx.root,
-                           **idx.freshness(rescan=True)})
-        return _dumps(service.status(deep=True))
+        def run():
+            if name:
+                idx = service.get(name)
+                return {"name": idx.name, "root": idx.root,
+                        **idx.freshness(rescan=True)}
+            return service.status(deep=True)
+        return _safe(run)
 
     @mcp.tool()
     def search_code(query: str, index: str = "", top_k: int = 8) -> str:
@@ -95,8 +114,8 @@ def build_server(service: Service, chat=None):
         fact cards, and the best matching source chunks. This is the primary
         entry point for "where is X", "what does X do", "who calls X".
         """
-        return _dumps(service.search(query, index=index or None,
-                                     top_k=max(1, min(top_k, 30))))
+        return _safe(service.search, query, index=index or None,
+                     top_k=max(1, min(top_k, 30)))
 
     @mcp.tool()
     def get_entity(name: str, index: str = "") -> str:
@@ -107,7 +126,7 @@ def build_server(service: Service, chat=None):
         exception sites (with whether each is inside a try/catch), the exact
         fact card, and the entity's source text.
         """
-        return _dumps(service.entity(name, index=index or None))
+        return _safe(service.entity, name, index=index or None)
 
     @mcp.tool()
     def get_neighbours(name: str, index: str = "", hops: int = 1) -> str:
@@ -117,8 +136,8 @@ def build_server(service: Service, chat=None):
         connection reach the logger?"). Returns the surrounding entities and
         their fact cards.
         """
-        return _dumps(service.neighbours(name, index=index or None,
-                                         hops=max(1, min(hops, 3))))
+        return _safe(service.neighbours, name, index=index or None,
+                     hops=max(1, min(hops, 3)))
 
     @mcp.tool()
     def find_symbol(pattern: str, index: str = "", limit: int = 50) -> str:
@@ -126,9 +145,15 @@ def build_server(service: Service, chat=None):
 
         `pattern` is case-insensitive; `*`, `?` and `[]` are glob wildcards.
         Example: `find_symbol("Tcp*")`, `find_symbol("handle")`.
+
+        Every hit carries a `match` field: exact / prefix / word / substring /
+        glob. Hits are ordered best-first, so a substring that happens to sit
+        mid-word ("Tcp" inside "adjusT-Cpu") never outranks a real symbol.
+        If you only see `substring` hits, the symbol you named probably does not
+        exist — check those before concluding it does.
         """
-        return _dumps(service.find(pattern, index=index or None,
-                                   limit=max(1, min(limit, 200))))
+        return _safe(service.find, pattern, index=index or None,
+                     limit=max(1, min(limit, 200)))
 
     @mcp.tool()
     def read_chunk(chunk_id: str, index: str = "") -> str:
@@ -137,7 +162,7 @@ def build_server(service: Service, chat=None):
         Accepts `index::chunk-id` or a bare chunk id. Returns the exact text
         with file, line range and kind.
         """
-        return _dumps(service.chunk(chunk_id, index=index or None))
+        return _safe(service.chunk, chunk_id, index=index or None)
 
     @mcp.tool()
     def reindex(name: str = "") -> str:
@@ -164,8 +189,8 @@ def build_server(service: Service, chat=None):
             Prefer search_code / get_entity and write the answer yourself; use
             this only when a grounded, citation-carrying draft is wanted.
             """
-            return _dumps(service.answer(question, chat, index=index or None,
-                                         top_k=max(1, min(top_k, 20))))
+            return _safe(service.answer, question, chat,
+                         index=index or None, top_k=max(1, min(top_k, 20)))
 
     return mcp
 

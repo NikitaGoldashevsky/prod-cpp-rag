@@ -105,6 +105,14 @@ Useful flags when a subtree contains vendored code:
     --exclude third_party --exclude build
 ```
 
+Generated code is skipped automatically (`obj/`, `CMakeFiles/`, `moc_*`, `ui_*`,
+`qrc_*`). Do **not** exclude a source directory by guesswork — a wrong exclude
+silently drops real code, which is worse than indexing a build tree.
+
+Each index lives in its own Neo4j **dataset** (a `dataset` property on every
+node, filtered by every query). Several submodules can therefore be live at once,
+and a question about `core` can never be answered out of `network`.
+
 ---
 
 ## 4. Sanity-check retrieval before wiring anything up
@@ -120,6 +128,10 @@ record.
 
 **Verify:** the search output contains a `[FACT]` line and at least one code
 chunk with `file:line`. The entity output contains `"found": true`.
+
+If you get `store_not_ready` instead, the index is on disk but not in the graph:
+`./.venv/bin/prod-rag neo4j push <name>`. Never work around it by switching to
+`--store memory` — you would be reporting on a different codebase.
 
 If both are empty, the index is fine but the query does not match anything —
 try a symbol name from the file list. If the entity is genuinely absent, the
@@ -161,8 +173,11 @@ Notes:
 
 **Verify** by calling the tools from your harness (or with a script):
 
-1. `list_indexes()` → returns the index you built in step 2.
-2. `find_symbol("SomeKnownName")` → returns at least one match.
+1. `list_indexes()` → returns the index you built in step 2, with
+   `store.ready: true` and an entity count.
+2. `find_symbol("SomeKnownName")` → returns at least one match whose `match` is
+   `exact`, `prefix` or `word`. A list of only `substring` hits means the symbol
+   does not exist under that name.
 3. `get_entity("SomeKnownName")` → returns `"found": true` with `callers`,
    `throw_sites` and `fact_card`.
 
@@ -223,9 +238,14 @@ index_status("<name>")      -> state: stale, with the changed files
 reindex("<name>")           -> rebuild (touches only the index, never the source)
 ```
 
-`reindex` re-parses the whole indexed subtree and, with `PROD_RAG_STORE=neo4j`,
-re-pushes it to the graph. Fractions of a second for a small submodule, ~31 s for
+`reindex` re-parses the whole indexed subtree and, on the Neo4j backend,
+re-pushes that dataset in the same call (`reindexed[].pushed` reports the counts).
+Fractions of a second for a small submodule, ~31 s to parse and ~18 s to push for
 500 files / 185k lines. Not incremental.
+
+If you rebuild from the CLI (`prod-rag index add …` without `--store neo4j`, or
+an index built on another machine), the graph lags the file index. `list_indexes`
+reports that as `store.hint`; fix it with `prod-rag neo4j push <name>`.
 
 ---
 
@@ -259,7 +279,8 @@ button per index, but new indexes also need a restart.
 - Never run `sudo pip install`, never modify the system Python, never disable
   the virtualenv.
 - Never point `NEO4J_URI` at a shared or production database. `neo4j push`
-  wipes `:Entity`/`:Chunk` unless `--keep` is given.
+  replaces only its own dataset; `--reset` wipes every dataset and needs the
+  human's explicit approval.
 - This tool reads source code and writes indexes. If a step appears to require
   editing the codebase, stop — that is not part of this setup.
 - Do not index a directory the human did not name.

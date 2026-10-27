@@ -2,9 +2,10 @@
   "mcpServers": {
     "prod-rag": {
       "command": "/home/YOU/PROD_RAG/.venv/bin/prod-rag",
-      "args": ["mcp"],
+      "args": ["mcp", "--store", "neo4j"],
       "env": {
-        "PROD_RAG_DATA": "/home/YOU/.local/share/prod-rag"
+        "PROD_RAG_DATA": "/home/YOU/.local/share/prod-rag",
+        "PROD_RAG_STORE": "neo4j"
       }
     }
   }

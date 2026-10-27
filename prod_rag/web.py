@@ -144,6 +144,9 @@ def make_handler(app: WebApp):
                 self._json(200, app.handle(path, payload))
             except LookupError as e:
                 self._json(404, {"error": str(e)})
+            except RuntimeError as e:
+                # StoreNotReady: the graph cannot answer for this index.
+                self._json(409, {"error": str(e)})
             except Exception as e:
                 self._json(500, {"error": f"{type(e).__name__}: {e}"})
 
@@ -163,6 +166,8 @@ def make_handler(app: WebApp):
                 self._json(400, {"error": str(e)})
             except LookupError as e:
                 self._json(404, {"error": str(e)})
+            except RuntimeError as e:
+                self._json(409, {"error": str(e)})
             except Exception as e:
                 traceback.print_exc()
                 self._json(500, {"error": f"{type(e).__name__}: {e}"})
@@ -371,14 +376,20 @@ function fmtStats(s) { return s ? `${s.files} files · ${s.entities} entities ·
 function renderIndexes() {
   const rows = STATUS.indexes || [];
   if (!rows.length) { $('idxBody').textContent = 'No indexes built.'; $('folderBody').textContent = ''; return; }
-  let h = '<table><tr><th>name</th><th>root</th><th>size</th><th>built</th><th>state</th><th></th></tr>';
+  let h = '<table><tr><th>name</th><th>root</th><th>size</th><th>built</th><th>state</th><th>graph</th><th></th></tr>';
   for (const r of rows) {
     const f = r.freshness || {};
+    const st = r.store;
+    const graph = !st ? '<span class="hint">in-memory</span>'
+      : st.ready
+        ? `<span class="badge b-fresh">neo4j</span><div class="hint">${st.entities} entities</div>`
+        : `<span class="badge b-stale">not pushed</span><div class="hint">${esc(st.hint||'')}</div>`;
     h += `<tr><td><b>${esc(r.name)}</b><div class="hint">${esc(r.label)}</div></td>
       <td class="mono">${esc(r.root)}</td><td>${fmtStats(r.stats)}</td>
       <td class="mono">${esc(r.built_at)}</td>
       <td><span class="badge b-${esc(f.state||'')}">${esc(f.state||'?')}</span>
         <div class="hint">${esc(f.detail||'')}</div></td>
+      <td>${graph}${st && st.hint && st.ready ? `<div class="hint">${esc(st.hint)}</div>` : ''}</td>
       <td><button class="ghost" onclick="reindex('${esc(r.name)}')">Rebuild</button></td></tr>`;
   }
   $('idxBody').innerHTML = h + '</table>';
